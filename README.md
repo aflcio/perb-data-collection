@@ -67,8 +67,7 @@ Agency profiles, reachability notes, and field maps live under
   rather than fragile scheduled scrapes.
 
 Default User-Agent identifies this project. Update the project URL in
-`perb_data_collection.http.DEFAULT_USER_AGENT` when you fork or publish under
-your own org.
+`perb_data_collection.http.DEFAULT_USER_AGENT` when you fork.
 
 ## Contributing
 

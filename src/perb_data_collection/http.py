@@ -10,7 +10,7 @@ from html import unescape
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (compatible; perb-data-collection/0.1; "
-    "+https://github.com/example/perb-data-collection)"
+    "+https://github.com/aflcio/perb-data-collection)"
 )
 
 
