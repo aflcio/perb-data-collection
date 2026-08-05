@@ -1,0 +1,31 @@
+[project]
+name = "perb-data-collection"
+version = "0.1.0"
+description = "Open-source research and collectors for U.S. state/territorial public-sector labor board (PERB) data."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "PERB Data Collection contributors" }]
+keywords = ["perb", "labor", "public-sector", "scraper", "collective-bargaining"]
+dependencies = []
+
+[project.optional-dependencies]
+browser = ["playwright>=1.49,<2"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+perb-collect = "perb_data_collection.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/perb_data_collection"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
