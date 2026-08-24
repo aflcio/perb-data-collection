@@ -69,12 +69,6 @@ def _canonical(case_type: str) -> str:
     code = _native_code(case_type)
     return _CASE_TYPE_MAP.get(code, "CERTIFICATION")
 
-def _jurisdiction_city(employer_name: str) -> str:
-    name = employer_name.strip()
-    name = re.sub(r"^District of Columbia\s+", "", name, flags=re.I)
-    name = re.sub(r"^D\.?C\.?\s+", "", name, flags=re.I)
-    return name.split(",")[0].strip()[:80]
-
 def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.I | re.S):
@@ -119,7 +113,11 @@ def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, s
                 "dc_register_cite": cite,
                 "document_name": document_name,
                 "document_url": document_url,
-                "jurisdiction_city": _jurisdiction_city(respondent),
+                # This board's jurisdiction is the District, not a city parsed
+                # from the agency name. The former parser turned values such as
+                # "District of Columbia Department of Aging..." into the bogus
+                # city "Department of Aging...", preventing geographic matches.
+                "jurisdiction_city": "Washington",
                 "jurisdiction_state": "DC",
                 "employer_street": "",
                 "employer_zip": "",

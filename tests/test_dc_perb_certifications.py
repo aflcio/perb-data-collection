@@ -18,6 +18,7 @@ def test_parse_certification_table_fixture() -> None:
     assert len(rows) >= 5
     sample = rows[0]
     assert sample["source_agency_code"] == "DC_PERB"
+    assert sample["jurisdiction_city"] == "Washington"
     assert sample["jurisdiction_state"] == "DC"
     assert sample["employer_name"]
     assert sample["row_key"].startswith("DC_PERB:")
