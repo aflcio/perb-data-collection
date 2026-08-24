@@ -88,7 +88,10 @@ def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, s
         certification_number = strip_html_text(cells[2])
         native_case_type = strip_html_text(cells[3])
         complainant = strip_html_text(cells[4]).rstrip(",")
-        respondent = strip_html_text(cells[5])
+        # The index carries a stray terminal comma on a handful of agency
+        # names. It is list punctuation, not part of the employer name (the
+        # complainant column has the same artifact).
+        respondent = strip_html_text(cells[5]).rstrip(",")
         cite = strip_html_text(cells[6]) if len(cells) > 6 else ""
         document_name = strip_html_text(cells[7]) if len(cells) > 7 else ""
         href_match = re.search(r'href="([^"]+)"', row_html, flags=re.I)
@@ -144,4 +147,3 @@ def scrape_certifications(
 def scrape_to_wide_csv(csv_path: Any, *, delay_seconds: float = 0.3) -> int:
     rows = scrape_certifications(delay_seconds=delay_seconds)
     return write_wide_csv(rows, csv_path, fieldnames=WIDE_FIELDNAMES)
-
