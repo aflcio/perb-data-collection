@@ -35,13 +35,23 @@ def test_parse_certification_table_fixture() -> None:
     albion = by_case["EE-3685"]
     assert "Albion" in albion["employer_name"]
     assert "Fire District" in albion["employer_name"]
+    assert "Lincoln" in albion["employer_name"]
+    assert albion["unit_description"] == ""
     assert "href=" not in albion["employer_name"].lower()
 
-    # Trailing unit text after </a> is kept with the link text, not alone.
+    # Unit descriptors move to unit_description; place parentheticals stay.
     clerks = by_case["EE-3430"]
-    assert clerks["employer_name"].startswith("Barrington")
-    assert "Clerks" in clerks["employer_name"]
-    assert not clerks["employer_name"].startswith("(")
+    assert clerks["employer_name"] == "Barrington"
+    assert "Clerks" in clerks["unit_description"]
+
+    bristol = by_case["EE-3083A"]
+    assert "Bristol" in bristol["employer_name"]
+    assert "Clerical" in bristol["unit_description"]
+    assert "Amended" in bristol["employer_name"]
+
+    chopmist = by_case["EE-3716"]
+    assert "Scituate" in chopmist["employer_name"]
+    assert "Rescue" in chopmist["unit_description"]
 
     assert all("href=" not in row["employer_name"].lower() for row in rows)
     assert all(row["jurisdiction_city"] == "" for row in rows)

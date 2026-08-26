@@ -65,6 +65,15 @@ _CASE_FROM_FILE_RE = re.compile(
     r"^(?:ULP-)?(?P<case>\d+[A-Z]?)\b",
     flags=re.I,
 )
+_DECISION_TYPE_LABEL_RE = re.compile(
+    r"(?i)^(Order of Dismissal|Probable Cause Determination|Unfair Labor Practice|"
+    r"Declaratory Statement|Representation Petition|Hearing Officer|PERB Decision|"
+    r"Executive Director|Board Decision|Bd Decision|Decision and Order|DS\s+\d|REP\s+\d|"
+    r"View decision)"
+)
+_FILE_DOC_TYPE_RE = re.compile(
+    r"(?i)\b(ULP|PCD|CLAR|OOD|DS|REP|Dec|Decision|Bd)\b"
+)
 
 def _absolute_url(href: str, base: str = BASE_URL) -> str:
     return urljoin(base.rstrip("/") + "/", href)
@@ -102,35 +111,76 @@ def _canonical(native_kind: str, title: str) -> str:
 def _parties_from_filename(filename: str) -> tuple[str, str]:
     stem = re.sub(r"\.pdf$", "", filename, flags=re.I)
     stem = re.sub(r"-website$", "", stem, flags=re.I)
+    # Prefer last -v- / -v.- / -v.-style split before normalizing dots.
+    match = re.search(r"^(?P<left>.+?)-v[.\s-]*(?P<right>.+)$", stem, flags=re.I)
+    if match:
+        left = re.sub(r"[.\-_]+", " ", match.group("left")).strip()
+        right = re.sub(r"[.\-_]+", " ", match.group("right")).strip()
+        # Drop leading case # / doc-type tokens from left
+        left = re.sub(
+            r"^(?:\d+[A-Z]?\s+)?(?:ULP\s+)?(?:PCD|Dec|OOD|CLAR|Bd Decision on Review|"
+            r"Order of Dismissal|Decision on the Merits|Appropriateness Determination|"
+            r"Bd\s+Decision\s+on\s+Review)\s+",
+            "",
+            left,
+            flags=re.I,
+        ).strip()
+        left = re.sub(
+            r"^(?:PCD|ULP|CLAR|Dec|OOD|Bd)\s+",
+            "",
+            left,
+            flags=re.I,
+        ).strip()
+        # Drop leftover "Bd Decision on Review …" wrappers on the petitioner side.
+        left = re.sub(
+            r"(?i)^Bd\s+Decision\s+on\s+Review\s+",
+            "",
+            left,
+        ).strip()
+        # Date tails on right like "1 29 26"
+        right = re.sub(r"\s+\d{1,2}\s+\d{1,2}\s+\d{2,4}$", "", right).strip()
+        if _is_decision_type_label(left):
+            left = ""
+        if _is_decision_type_label(right):
+            right = ""
+        return right, left  # employer, union
+
     stem = stem.replace(".", " ")
-    # Prefer last -v- / -v.- split
-    match = re.search(r"^(?P<left>.+?)-v[.-](?P<right>.+)$", stem, flags=re.I)
-    if not match:
+    # Older year archives: 1984-1-11-84-3-DS-Capital-Educators-Assn.pdf
+    # Strip leading date/code tokens, keep the trailing party phrase.
+    tokens = [t for t in re.split(r"[-_]+", stem) if t]
+    while tokens and (
+        tokens[0].isdigit()
+        or re.fullmatch(r"\d+[A-Za-z]?", tokens[0])
+        or _FILE_DOC_TYPE_RE.fullmatch(tokens[0])
+    ):
+        tokens.pop(0)
+    if not tokens:
         return "", ""
-    left = re.sub(r"[-_]+", " ", match.group("left")).strip()
-    right = re.sub(r"[-_]+", " ", match.group("right")).strip()
-    # Drop leading case # / doc-type tokens from left
-    left = re.sub(
-        r"^(?:\d+[A-Z]?\s+)?(?:ULP\s+)?(?:PCD|Dec|OOD|CLAR|Bd Decision on Review|"
-        r"Order of Dismissal|Decision on the Merits|Appropriateness Determination)\s+",
-        "",
-        left,
-        flags=re.I,
-    ).strip()
-    left = re.sub(
-        r"^(?:PCD|ULP|CLAR|Dec|OOD|Bd)\s+",
-        "",
-        left,
-        flags=re.I,
-    ).strip()
-    # Date tails on right like "1 29 26"
-    right = re.sub(r"\s+\d{1,2}\s+\d{1,2}\s+\d{2,4}$", "", right).strip()
-    return right, left  # employer, union
+    party = " ".join(tokens).strip()
+    party = re.sub(r"\s+", " ", party)
+    if not party or _is_decision_type_label(party):
+        return "", ""
+    # Assn/Union/Educators → union column; Board/City/County/School → employer.
+    if re.search(r"(?i)\b(Assn|Association|Union|Federation|Council|Local)\b", party):
+        return "", party
+    return party, ""
+
+
+def _is_decision_type_label(value: str) -> bool:
+    return bool(_DECISION_TYPE_LABEL_RE.match(value.strip()))
+
 
 def _jurisdiction_city(employer_name: str) -> str:
     name = employer_name.strip()
+    if not name or _is_decision_type_label(name):
+        return ""
     name = re.sub(r"^(City|Town|County)\s+of\s+", "", name, flags=re.I)
-    return name.split(",")[0].strip()[:80]
+    city = name.split(",")[0].strip()[:80]
+    # Employer names that are agencies/boards are not cities.
+    if re.search(r"(?i)\b(Board|Department|Commission|Authority|Assn|Association)\b", city):
+        return ""
+    return city
 
 def parse_year_page(
     html: str,
@@ -168,8 +218,11 @@ def parse_year_page(
             case_number = re.sub(r"[^A-Za-z0-9]+", "-", filename)[:40]
 
         employer, union = _parties_from_filename(filename)
-        if not employer:
+        if not employer and desc and not _is_decision_type_label(desc):
             employer = desc[:120]
+        # Never keep a decision-type label as employer or city.
+        if employer and _is_decision_type_label(employer):
+            employer = ""
         native = kind or (
             "ULP"
             if "ulp" in title.lower()

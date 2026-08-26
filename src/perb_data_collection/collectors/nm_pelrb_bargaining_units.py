@@ -44,6 +44,7 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "jurisdiction_state",
     "employer_street",
     "employer_zip",
+    "roster_as_of_date",
     "source_pdf_url",
     "source_page_url",
     "source_url",
@@ -66,12 +67,56 @@ _ROMAN_OUTLINE_RE = re.compile(
     r"^\s*(i{1,3}|iv|vi{0,3}|ix|x)\.\s+",
     flags=re.I,
 )
+# Tolerate doubled periods in the roster ("approx.. 10 employees").
 _APPROX_RE = re.compile(
-    r"\(approx\.\s*([\d,]+)\s+employees?\)\.?",
+    r"\(approx\.+\s*([\d,]+)\s+employees?\)\.?",
     flags=re.I,
 )
 _APPROX_INLINE_RE = re.compile(
-    r"approx\.\s*([\d,]+)\s+employees?",
+    r"approx\.+\s*([\d,]+)\s+employees?",
+    flags=re.I,
+)
+_AS_OF_HEADER_RE = re.compile(
+    r"Updated\s+(?P<mon>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
+    r"Nov(?:ember)?|Dec(?:ember)?)\.?\s+(?P<year>(?:19|20)\d{2})",
+    flags=re.I,
+)
+_AS_OF_FILENAME_RE = re.compile(
+    r"-(?P<mon>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+    r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
+    r"Nov(?:ember)?|Dec(?:ember)?)-(?P<year>(?:19|20)\d{2})\.pdf$",
+    flags=re.I,
+)
+_MONTH_NUM = {
+    "jan": "01",
+    "january": "01",
+    "feb": "02",
+    "february": "02",
+    "mar": "03",
+    "march": "03",
+    "apr": "04",
+    "april": "04",
+    "may": "05",
+    "jun": "06",
+    "june": "06",
+    "jul": "07",
+    "july": "07",
+    "aug": "08",
+    "august": "08",
+    "sep": "09",
+    "sept": "09",
+    "september": "09",
+    "oct": "10",
+    "october": "10",
+    "nov": "11",
+    "november": "11",
+    "dec": "12",
+    "december": "12",
+}
+_UNIONISH_RE = re.compile(
+    r"\b(Association|Ass'?n|Union|Federation|AFSCME|NEA|AFT|CWA|IAFF|Teamsters|"
+    r"Council\s+\d+)\b",
     flags=re.I,
 )
 _PAGE_FOOTER_RE = re.compile(r"^\s*\d+\s*\|\s*P\s*a\s*g\s*e\s*$", flags=re.I)
@@ -151,15 +196,41 @@ def _split_union_and_unit(body: str) -> tuple[str, str]:
     return union or body, inner
 
 def _jurisdiction_city(employer_name: str) -> str:
+    """Return a city only when the employer string explicitly encodes one.
+
+    Counties, school districts, authorities, and universities are not cities —
+    leave those empty rather than copying the employer into ACE's city field
+    (infra-42).
+    """
     name = employer_name.strip()
     if "," in name:
         left, right = name.split(",", 1)
         # "Albuquerque, City of" → Albuquerque
-        if re.search(r"\b(City|Town|Village|County)\s+of\b", right, flags=re.I):
+        if re.search(r"\b(City|Town|Village)\s+of\b", right, flags=re.I):
             return left.strip()
-    if name.lower().startswith("state of "):
+    return ""
+
+
+def _roster_as_of_date(*, text: str, pdf_url: str) -> str:
+    """ISO month date (YYYY-MM-01) from roster header or PDF filename."""
+    match = _AS_OF_HEADER_RE.search(text) or _AS_OF_FILENAME_RE.search(pdf_url)
+    if not match:
         return ""
-    return name.split("(")[0].strip()
+    mon = _MONTH_NUM.get(match.group("mon").lower().rstrip("."), "")
+    year = match.group("year")
+    return f"{year}-{mon}-01" if mon else ""
+
+
+def _looks_like_union(name: str) -> bool:
+    return bool(_UNIONISH_RE.search(name))
+
+
+def _unit_without_union(body: str) -> bool:
+    """True when the roster entry is a unit description with no bargaining agent."""
+    if _looks_like_union(body):
+        return False
+    # Typical no-union form: "Anthony Police Dept (Full-time …)"
+    return bool(re.match(r"^[A-Z].+\([^)]+\)\s*$", body.strip()))
 
 def _slug_employer(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", name.strip().upper()).strip("_")
@@ -175,12 +246,14 @@ def parse_units_text(
     section = ""
     employer = ""
     parent_union = ""
+    state_heading_is_employer = False
     rows: list[dict[str, str]] = []
     buf: list[str] = []
     mode: str | None = None
+    roster_as_of = _roster_as_of_date(text=text, pdf_url=pdf_url)
 
     def flush() -> None:
-        nonlocal buf, mode, employer, parent_union
+        nonlocal buf, mode, employer, parent_union, state_heading_is_employer
         if not buf or not mode:
             buf = []
             return
@@ -193,11 +266,21 @@ def parse_units_text(
             name = match.group(2).strip().rstrip(":")
             name, _ = _extract_approx(name)
             if section == "UNIONS REPRESENTING STATE EMPLOYEES":
-                parent_union = name
-                employer = "State of New Mexico"
+                # Most headings are unions (AFSCME Council 18). The School for the
+                # Deaf block titles the employer and puts the association under
+                # the unit letter (infra-42).
+                if _looks_like_union(name):
+                    parent_union = name
+                    employer = "State of New Mexico"
+                    state_heading_is_employer = False
+                else:
+                    parent_union = ""
+                    employer = name
+                    state_heading_is_employer = True
             else:
                 employer = name
                 parent_union = ""
+                state_heading_is_employer = False
             return
 
         match = re.match(r"^([a-z])\.\s+(.+)$", joined, flags=re.I)
@@ -208,13 +291,28 @@ def parse_units_text(
         section_slug = _SECTION_SLUGS.get(section, section.lower().replace(" ", "_"))
 
         if section == "UNIONS REPRESENTING STATE EMPLOYEES":
-            agency = body.split("(")[0].strip() or body
-            union_name = parent_union or body
+            if state_heading_is_employer:
+                employer_name = employer
+                if _looks_like_union(body.split("(")[0]):
+                    union_name, unit_name = _split_union_and_unit(body)
+                else:
+                    union_name, unit_name = "", body
+            else:
+                agency = body.split("(")[0].strip() or body
+                union_name = parent_union or body
+                unit_name = body
+                employer_name = agency
+        elif _unit_without_union(body):
+            # Roster lists a unit with no bargaining agent — do not invent a union.
+            employer_name = employer
+            union_name = ""
             unit_name = body
-            employer_name = agency
         else:
             union_name, unit_name = _split_union_and_unit(body)
             employer_name = employer
+            if not unit_name and union_name == body:
+                # Entire body is the union with no separate unit parenthetical.
+                unit_name = ""
 
         row_key = (
             f"{AGENCY_CODE}:{section_slug}:"
@@ -236,6 +334,7 @@ def parse_units_text(
                 "jurisdiction_state": "NM",
                 "employer_street": "",
                 "employer_zip": "",
+                "roster_as_of_date": roster_as_of,
                 "source_pdf_url": pdf_url,
                 "source_page_url": LISTING_URL,
                 "source_url": pdf_url,
@@ -249,7 +348,10 @@ def parse_units_text(
             continue
         if _PAGE_FOOTER_RE.match(line):
             continue
-        if re.search(r"NEW MEXICO PUBLIC BARGAINING|UNIT INFORMATION|Updated Feb", line, re.I):
+        if re.search(r"NEW MEXICO PUBLIC BARGAINING|UNIT INFORMATION", line, re.I):
+            continue
+        # Keep "Updated Feb. 2026" lines for as-of extraction; do not treat as content.
+        if _AS_OF_HEADER_RE.search(line):
             continue
         if re.search(r"^Table of Contents", line, re.I):
             continue

@@ -59,6 +59,24 @@ _DATE_IN_TITLE_RE = re.compile(
     r"September|October|November|December)\s+\d{1,2},\s+\d{4})\s*$",
     flags=re.I,
 )
+_ISSUED_RE = re.compile(
+    r"Issued:\s*(?P<date>(?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+\d{1,2},\s+\d{4})",
+    flags=re.I,
+)
+_PUBLIC_EMPLOYER_RE = re.compile(
+    r"(?P<name>[A-Z0-9][^,\n]{2,120}?),\s*(?:\n\s*)?"
+    r"(?:Petitioner\s+and\s+)?Public\s+Employer\.?",
+    flags=re.I | re.S,
+)
+_PETITIONER_RE = re.compile(
+    r"(?P<name>[A-Z0-9][^,\n]{2,120}?),\s*(?:\n\s*)?Petitioner(?:\s+and\s+Public\s+Employer)?\.?",
+    flags=re.I | re.S,
+)
+_TRAILING_CASE_RE = re.compile(
+    r",?\s*(?:No\.\s*)?(?:\d{2}-[A-Z]+(?:-\d+[A-Z]?)?|\d+\s*A\.?\s*2d\s*\d+)\.?\s*$",
+    flags=re.I,
+)
 
 _PREFIX_CANONICAL = {
     "E": "CERTIFICATION",
@@ -123,8 +141,57 @@ def _canonical_from_title(prefix: str, title: str) -> tuple[str, str]:
     canonical = _PREFIX_CANONICAL.get(prefix.upper(), "CERTIFICATION")
     return canonical, native
 
+def _clean_party_name(name: str) -> str:
+    cleaned = strip_html_text(name)
+    cleaned = cleaned.replace("\xa0", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(",.")
+    cleaned = _TRAILING_CASE_RE.sub("", cleaned).strip().rstrip(",")
+    return cleaned
+
+
+def _parties_from_body(html: str) -> tuple[str, str, str]:
+    """Prefer labeled Petitioner / Public Employer blocks over caption order."""
+    text = strip_html_text(html)
+    text = text.replace("\xa0", " ")
+    decision_date = ""
+    issued = _ISSUED_RE.search(text)
+    if issued:
+        decision_date = issued.group("date")
+
+    employer = ""
+    union = ""
+    emp_match = _PUBLIC_EMPLOYER_RE.search(text)
+    if emp_match:
+        employer = _clean_party_name(emp_match.group("name"))
+        # "Petitioner and Public Employer" means the same party is both.
+        if re.search(r"Petitioner\s+and\s+Public\s+Employer", emp_match.group(0), re.I):
+            # Find the other party after "and" in the caption block.
+            after = text[emp_match.end() : emp_match.end() + 400]
+            other = re.search(
+                r"\band\b\s*(?P<name>[A-Z0-9][^,\n]{2,120}?)(?:,|\n|$)",
+                after,
+                flags=re.I,
+            )
+            if other:
+                union = _clean_party_name(other.group("name"))
+            return employer, union, decision_date
+
+    pet_match = _PETITIONER_RE.search(text)
+    if pet_match:
+        petitioner = _clean_party_name(pet_match.group("name"))
+        if employer and petitioner and petitioner.lower() != employer.lower():
+            union = petitioner
+        elif not employer:
+            # Petitioner-only without Public Employer label — leave roles unset
+            # rather than guessing caption order.
+            pass
+    if employer:
+        return employer, union, decision_date
+    return "", "", decision_date
+
+
 def _parties_from_title(title: str) -> tuple[str, str, str]:
-    """Return (employer_name, union_name, decision_date) heuristics from <title>."""
+    """Fallback when the decision HTML has no Petitioner / Public Employer labels."""
     cleaned = strip_html_text(title)
     decision_date = ""
     date_match = _DATE_IN_TITLE_RE.search(cleaned)
@@ -132,10 +199,14 @@ def _parties_from_title(title: str) -> tuple[str, str, str]:
         decision_date = date_match.group("date")
         cleaned = cleaned[: date_match.start()].rstrip().rstrip(",")
 
-    # Drop trailing ", No. YY-XX-NN"
-    cleaned = re.sub(r",\s*No\.\s*[\w-]+\s*$", "", cleaned, flags=re.I).strip()
+    cleaned = _TRAILING_CASE_RE.sub("", cleaned).strip().rstrip(",")
 
-    # "In Re: Petition for Decertification, EMPLOYER ..."
+    # Split on " v. " as well as " and ".
+    splitter = re.split(r"\s+v\.\s+|\s+and\s+", cleaned, maxsplit=1, flags=re.I)
+    if len(splitter) == 2:
+        left, right = splitter[0].strip(), splitter[1].strip()
+        return "", "", decision_date  # do not invent roles from caption order
+
     in_re = re.match(r"^In\s+Re:\s*(.+)$", cleaned, flags=re.I)
     if in_re:
         body = in_re.group(1).strip()
@@ -145,59 +216,50 @@ def _parties_from_title(title: str) -> tuple[str, str, str]:
             body,
             flags=re.I,
         ).strip()
-        # Often "SAD 5 Bus Drivers (MEA and Teamsters)"
         paren = re.search(r"\(([^)]+)\)\s*$", body)
         if paren:
             return body[: paren.start()].strip(), paren.group(1).strip(), decision_date
         return body, "", decision_date
 
-    # "Union and Employer" / "Employer and Union"
-    if " and " in cleaned:
-        left, right = cleaned.split(" and ", 1)
-        left, right = left.strip(), right.strip()
-        # Prefer public-employer-looking side as employer.
-        employer_hints = (
-            "msad",
-            "sad",
-            "rsu",
-            "school",
-            "city",
-            "town",
-            "county",
-            "university",
-            "college",
-            "state",
-            "district",
-        )
-        left_is_emp = any(h in left.lower() for h in employer_hints)
-        right_is_emp = any(h in right.lower() for h in employer_hints)
-        if right_is_emp and not left_is_emp:
-            return right, left, decision_date
-        if left_is_emp and not right_is_emp:
-            return left, right, decision_date
-        return right, left, decision_date
+    return "", "", decision_date
 
-    return cleaned, "", decision_date
 
 def _jurisdiction_city(employer_name: str) -> str:
     name = employer_name.strip()
     if not name:
         return ""
+    # Do not treat case captions / citations as cities.
+    if re.search(r"(?i)\bv\.|No\.|A\.2d", name):
+        return ""
     name = re.sub(r"^(City|Town|Village)\s+of\s+", "", name, flags=re.I)
-    return name.split(",")[0].strip()
+    city = name.split(",")[0].strip()
+    if len(city) > 60:
+        return ""
+    return city
 
-def parse_case_title(
+
+def parse_case_page(
     *,
     filename: str,
-    title: str,
+    html: str,
     case_url: str,
     scraped_at: str,
 ) -> dict[str, str]:
     stem = filename.rsplit(".", 1)[0]
     case_number = _normalize_case_number(stem)
     prefix = _prefix_from_filename(filename)
+    title_match = _TITLE_RE.search(html)
+    title = strip_html_text(title_match.group(1)) if title_match else filename
     canonical, native = _canonical_from_title(prefix, title)
-    employer_name, union_name, decision_date = _parties_from_title(title)
+
+    employer_name, union_name, decision_date = _parties_from_body(html)
+    if not employer_name and not union_name:
+        employer_name, union_name, title_date = _parties_from_title(title)
+        decision_date = decision_date or title_date
+    elif not decision_date:
+        _, _, title_date = _parties_from_title(title)
+        decision_date = title_date
+
     return {
         "row_key": f"{AGENCY_CODE}:{case_number}",
         "source_agency_code": AGENCY_CODE,
@@ -206,7 +268,7 @@ def parse_case_title(
         "native_case_type": native,
         "employer_name": employer_name,
         "union_name": union_name,
-        "document_title": strip_html_text(title),
+        "document_title": title,
         "decision_date": decision_date,
         "jurisdiction_city": _jurisdiction_city(employer_name),
         "jurisdiction_state": "ME",
@@ -216,6 +278,23 @@ def parse_case_title(
         "source_url": case_url,
         "scraped_at": scraped_at,
     }
+
+
+def parse_case_title(
+    *,
+    filename: str,
+    title: str,
+    case_url: str,
+    scraped_at: str,
+) -> dict[str, str]:
+    """Back-compat wrapper used by older callers/tests; title-only path."""
+    html = f"<html><head><title>{title}</title></head><body></body></html>"
+    return parse_case_page(
+        filename=filename,
+        html=html,
+        case_url=case_url,
+        scraped_at=scraped_at,
+    )
 
 def scrape_unit_rep_cases(
     *,
@@ -234,16 +313,15 @@ def scrape_unit_rep_cases(
     rows: list[dict[str, str]] = []
     for filename in files:
         case_url = _absolute_url(filename)
-        title = filename
+        page = ""
         if fetch_case_titles:
             page = fetcher(case_url, delay_seconds=delay_seconds)
-            match = _TITLE_RE.search(page)
-            if match:
-                title = strip_html_text(match.group(1))
+        if not page:
+            page = f"<html><head><title>{filename}</title></head><body></body></html>"
         rows.append(
-            parse_case_title(
+            parse_case_page(
                 filename=filename,
-                title=title,
+                html=page,
                 case_url=case_url,
                 scraped_at=scraped_at,
             )

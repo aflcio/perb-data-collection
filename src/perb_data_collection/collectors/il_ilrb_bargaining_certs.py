@@ -273,17 +273,80 @@ def _normalize_date(raw: str) -> str:
     return "/".join(parts)
 
 def _jurisdiction_city(employer_name: str) -> str:
+    if not employer_name or re.search(
+        r"(?i)Declaration of Disinterest|\bPolice\s*#|\bOrder of Labor",
+        employer_name,
+    ):
+        return ""
     match = re.search(r"^([^,]+),\s*(City|Village|Town)\s+of\b", employer_name, re.I)
     if match:
         return match.group(1).strip()
     match = re.search(r"(City|Village|Town|County)\s+of\s+([^,(]+)", employer_name, re.I)
     if match:
-        return match.group(2).strip()
+        city = match.group(2).strip()
+        city = re.sub(r"\s+Local\b.*$", "", city, flags=re.I).strip()
+        return city
     if re.search(r"\bCounty\b", employer_name, re.I):
         return employer_name.split(",")[0].strip()
     if employer_name.lower().startswith("state of"):
         return ""
-    return employer_name.split(",")[0].split("(")[0].strip()[:80]
+    city = employer_name.split(",")[0].split("(")[0].strip()[:80]
+    if re.search(r"(?i)\b(Local|Association|Union|Council)\b", city):
+        return ""
+    return city
+
+
+def _heal_shredded_fields(
+    *,
+    certified: str,
+    employer: str,
+    union: str,
+    party: str,
+) -> tuple[str, str, str, str]:
+    """Recover dates spilled into union/party and drop digit-only prevailing party.
+
+    The FY PDF column bounds often shift so the Date Certified glyph lands in Labor
+    Organization (infra-38). Prefer extracting a real date over leaving certified
+    blank and a shredded union.
+    """
+    haystack = f"{union} {party} {employer}"
+    if not certified:
+        # Prefer full m/d/yyyy, then m/d/yy, then truncated m/d forms with year nearby.
+        full = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", haystack)
+        short = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2})\b", haystack)
+        # Truncated: "05/10/202" or "/19/2013" paired with a year fragment
+        truncated = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,3})\b", haystack)
+        slash_year = re.search(r"(?<!\d)(/?\d{1,2}/\d{4})\b", haystack)
+        pick = full or short or truncated or slash_year
+        if pick:
+            raw = pick.group(1).lstrip("/")
+            # Pad truncated years like 05/10/202 → leave as-is for normalize if 2-digit
+            parts = raw.split("/")
+            if len(parts) == 3 and len(parts[2]) == 3:
+                # Incomplete year — do not invent the missing digit
+                pass
+            else:
+                certified = _normalize_date(raw)
+
+    if certified:
+        # Strip date tokens out of the union string so matchers see the name.
+        union = _DATE_RE.sub(" ", union)
+        union = re.sub(r"(?<!\d)/\d{4}\b", " ", union)
+        union = re.sub(r"\s+", " ", union).strip(" ,/")
+
+    # Bare digits or shredded caption crumbs are not a prevailing party name.
+    if party and (
+        re.fullmatch(r"\d{1,4}", party)
+        or (
+            len(party) <= 24
+            and not re.search(r"(?i)[A-Za-z]{3,}", party)
+        )
+        or re.fullmatch(r"[\d\s/]+", party)
+    ):
+        party = ""
+
+    return certified, employer, union, party
+
 
 def parse_certs_text(
     text: str,
@@ -350,7 +413,12 @@ def parse_certs_text(
             if unit_c.strip():
                 unit_parts.append(unit_c)
 
-            date_match = _DATE_RE.search(cert_c) or _DATE_RE.search(cert_c + party_c)
+            date_match = (
+                _DATE_RE.search(cert_c)
+                or _DATE_RE.search(cert_c + party_c)
+                or _DATE_RE.search(lab_c)
+                or _DATE_RE.search(party_c)
+            )
             if date_match and not certified:
                 certified = _normalize_date(date_match.group(1))
                 date_line_employees = emps_c
@@ -390,6 +458,13 @@ def parse_certs_text(
             canonical = "UNIT_CLARIFICATION"
         else:
             canonical = "CERTIFICATION"
+
+        certified, employer, union, party = _heal_shredded_fields(
+            certified=certified,
+            employer=employer,
+            union=union,
+            party=party,
+        )
 
         case_number = "+".join(cases)
         rows.append(
