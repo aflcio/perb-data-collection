@@ -8,6 +8,7 @@ exist in this repo.
 |-----|---------|
 | [43-states-perb.md](43-states-perb.md) | Agency profiles, tiers, archetypes |
 | [registry.md](registry.md) | Current collector status |
+| [representation-gaps-2026-08-26.md](representation-gaps-2026-08-26.md) | Representation-only backlog (OH / NJ pivot / MI re-probe; network classes) |
 | [playbook.md](playbook.md) | Dual-probe research method |
 | [agencies/](agencies/) | Per-agency notes and run commands |
 | [../schema.md](../schema.md) | Shared wide-column contract |

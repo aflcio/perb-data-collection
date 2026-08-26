@@ -28,14 +28,14 @@ Run any shipped collector: `perb-collect <slug> --out ./out` (see `perb-collect 
 | Ohio | SERB | planned | — | Public CBA DataTable ~29,403 rows (browser OK; curl often 404). Top remaining candidate. | [oh-serb-clearinghouse.md](agencies/oh-serb-clearinghouse.md) |
 | Washington | PERC | collector_shipped | `wa-perc-certifications` | Pending-representation listing. Decisia historical cert search still CAPTCHA. | [wa-perc-certifications.md](agencies/wa-perc-certifications.md) |
 | Massachusetts | DLR/CERB | not_started | — | Employer autocomplete (~1,096 names); no bulk cert list. | [ma-dlr-certifications.md](agencies/ma-dlr-certifications.md) |
-| Michigan | MERC | blocked | — | Year cert PDFs are image scans; needs OCR. | [mi-merc-certifications.md](agencies/mi-merc-certifications.md) |
+| Michigan | MERC | blocked | — | Year cert PDFs image-scan historically; re-probe 2024–2026 with `pdftotext` before any OCR chase. | [mi-merc-certifications.md](agencies/mi-merc-certifications.md) |
 | Florida | PERC | oneshot_only | `fl-perc-certifications` | ~2,185 certs. Many hosts time out on curl; use browser/off-host refresh. | [fl-perc-certifications.md](agencies/fl-perc-certifications.md) |
 | Iowa | EAB (PERB) | collector_shipped | `ia-eab-unit-certifications` | ~1,005 unit-cert listing rows. SuPERB search still broken. | [ia-eab-unit-certifications.md](agencies/ia-eab-unit-certifications.md) |
 | Rhode Island | RISLRB | collector_shipped | `rislrb-certifications` | Certification listing tables. | [rislrb-certifications.md](agencies/rislrb-certifications.md) |
 | Wisconsin | WERC | collector_shipped | `werc-election-results` | Election-result PDFs via `pdftotext`. | [werc-election-results.md](agencies/werc-election-results.md) |
 | California | PERB | collector_shipped | `ca-perb-decisions` | WP REST Decision Bank (~4k). | [ca-perb-decisions.md](agencies/ca-perb-decisions.md) |
 | Illinois | ILRB | collector_shipped | `il-ilrb-bargaining-certs` | FY certification PDFs. IELRB out of scope. | [il-ilrb-bargaining-certs.md](agencies/il-ilrb-bargaining-certs.md) |
-| New Jersey | PERC | collector_shipped | `nj-perc-issued-decisions` | Domino IssuedDecisions XML (~5k PDFs). | [nj-perc-issued-decisions.md](agencies/nj-perc-issued-decisions.md) |
+| New Jersey | PERC | collector_shipped | `nj-perc-issued-decisions` | IssuedDecisions ~5k, **no union**. Prefer Contracts-by-Employer for representation (see 2026-08-26 gaps note). | [nj-perc-issued-decisions.md](agencies/nj-perc-issued-decisions.md) |
 | New York | PERB + NYC OCB | partial | `nyc-ocb-bargaining-units` | OCB 85-unit roster shipped. Live `perb.ny.gov` representation absent; Lexum CAPTCHA. | [nyc-ocb-bargaining-units.md](agencies/nyc-ocb-bargaining-units.md) |
 | Pennsylvania | PLRB | collector_shipped | `pa-plrb-final-orders` | Year-indexed Final Orders PDFs. | [pa-plrb-final-orders.md](agencies/pa-plrb-final-orders.md) |
 | Minnesota | BMS | oneshot_only | `mn-bms-certifications` | Harvest JSONL ingest; live search CAPTCHA/WAF. | [mn-bms-representation.md](agencies/mn-bms-representation.md) |
@@ -70,13 +70,19 @@ Keep these next to the registry so new contributors do not rediscover them the h
 | Pattern | Boards | Guidance |
 |---------|--------|----------|
 | Soft bot gate (curl fails, browser OK) | FL, NH, OH, often KS www | Document oneshot / Playwright; do not pretend cron will work from every IP |
-| Hard WAF / reject page | CT SBLR, MT BOPA, MN search | Do not build a scheduled collector; seek adjacent lists or records requests |
+| Hard WAF / reject page | CT SBLR (BITS), MT BOPA, MN search (Radware) | Do not build a scheduled collector; seek adjacent lists or records requests |
+| Akamai 403 | NH site + `mm.nh.gov` PDFs; sometimes KS www | Browser / Documents API harvest; alternate host when available |
+| Decisia / Lexum CAPTCHA | WA historical certs; NY Lexum | No CAPTCHA SaaS; FOIA if historical WA is required |
 | False-positive “captcha” strings | CA PERB | Confirm real API/HTML payload before marking blocked |
-| Image-only PDFs | MI MERC | Needs OCR; plain `pdftotext` is not enough |
-| Better primary than the bookmark | IA EAB vs SuPERB; KS labordecisions vs www; NH Documents API | Prefer cert registries and structured APIs |
+| Image-only PDFs | MI MERC | Re-probe recent year PDFs with `pdftotext` first; OCR only if still empty |
+| Better primary than the bookmark | IA EAB vs SuPERB; KS labordecisions vs www; NH Documents API; NJ Contracts vs IssuedDecisions | Prefer cert registries, CBA unit indexes, and structured APIs |
+| Not Zscaler | — | PERB blocks are host/WAF/CAPTCHA. Laptop Zscaler ≠ flogic egress to Akamai/BITS |
+
+Representation-focused backlog (2026-08-26): [representation-gaps-2026-08-26.md](representation-gaps-2026-08-26.md).
 
 ## Priorities
 
-1. **OH SERB** CBA archive oneshot (~29k structured rows).
-2. Optional: MA employer-walk cert POC; IN only if education scope is wanted.
-3. Leave MI/CT/MT blocked until a real primary or OCR path exists.
+1. **OH SERB** CBA archive oneshot (~29k structured rows: employer + union + unit).
+2. **NJ** Contracts-by-Employer research POC (IssuedDecisions is not representation-ready).
+3. **MI** soft `pdftotext` re-probe on 2024–2026 year cert PDFs; build only if text recovers. Leave CT/MT blocked.
+4. Optional: MA employer-walk cert POC; IN only if education scope is wanted. NH/FL/MN browser refresh when stale (already oneshot corpora).
