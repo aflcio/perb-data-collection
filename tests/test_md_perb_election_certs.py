@@ -20,6 +20,16 @@ def test_parse_listing_items_from_fixture() -> None:
     assert sample["canonical_case_type"] == "CERTIFICATION"
     assert sample["source_agency_code"] == "MD_PERB"
     assert sample["pdf_url"].startswith("https://laborboard.maryland.gov/")
+    rows_by_key = {row["row_key"]: row for row in rows}
+    assert rows_by_key["MD_PERB:418"]["employer_name"] == "Howard Community College"
+    assert rows_by_key["MD_PERB:418"]["union_name"] == (
+        "Service Employees International Union, Local 500"
+    )
+    assert rows_by_key["MD_PERB:379"]["case_number"] == "SHELRB EL 07-01"
+    assert rows_by_key["MD_PERB:346"]["canonical_case_type"] == "ULP"
+    assert rows_by_key["MD_PERB:418"]["document_description"] == (
+        "Certification Of Representative"
+    )
 
 
 def test_scrape_election_certifications_uses_fixture() -> None:
@@ -29,7 +39,12 @@ def test_scrape_election_certifications_uses_fixture() -> None:
         return html
 
     rows = scrape_election_certifications(fetch_html=fake_fetch)
-    assert len(rows) == 36
+    assert len(rows) == 34
+    row_keys = {row["row_key"] for row in rows}
+    assert "MD_PERB:412" not in row_keys
+    assert "MD_PERB:425" not in row_keys
+    assert all(row["employer_name"] for row in rows)
+    assert all(row["union_name"] for row in rows)
 
 
 def test_scrape_raises_when_displayed_total_mismatches() -> None:

@@ -92,9 +92,11 @@ def _parse_certification_table(
         employer_cell = cells[0]
         cert_href = re.search(r'href="([^"]+)"', employer_cell, flags=re.I)
         cert_pdf = urljoin(page_url, cert_href.group(1)) if cert_href else ""
-        employer_name = strip_html_text(employer_cell.split("</a>", 1)[-1])
-        if not employer_name and cert_href:
-            employer_name = strip_html_text(cert_href.group(0))
+        # Employer text lives inside the <a> (and sometimes after it). Taking only
+        # post-</a> text left many cells empty, and the old fallback wrote the raw
+        # href="…" attribute into employer_name (infra-36). Never use the href as
+        # a display value.
+        employer_name = strip_html_text(employer_cell)
 
         union_name = strip_html_text(cells[2])
         date_certified, date_amended = _extract_dates(strip_html_text(cells[3]))
@@ -107,7 +109,9 @@ def _parse_certification_table(
         canonical = "UNIT_CLARIFICATION" if disposition_pdf else "CERTIFICATION"
         row_key = f"{AGENCY_CODE}:{case_key}:{category}"
 
-        jurisdiction_city = employer_name.split(",")[0].strip()
+        # Listing pages do not state a reliable city; deriving city from
+        # employer_name leaked href= markup and unit descriptors into ACE.
+        jurisdiction_city = ""
         rows.append(
             {
                 "row_key": row_key,

@@ -18,6 +18,7 @@ def test_parse_certification_table_fixture() -> None:
     assert len(rows) >= 5
     sample = rows[0]
     assert sample["source_agency_code"] == "DC_PERB"
+    assert sample["jurisdiction_city"] == "Washington"
     assert sample["jurisdiction_state"] == "DC"
     assert sample["employer_name"]
     assert sample["row_key"].startswith("DC_PERB:")
@@ -42,3 +43,18 @@ def test_scrape_certifications_uses_fixture() -> None:
 
     rows = scrape_certifications(fetch_html=fake_fetch)
     assert len(rows) >= 5
+
+
+def test_parse_certification_table_removes_employer_list_punctuation() -> None:
+    html = (FIXTURES / "dc_perb_certifications_page.html").read_text()
+    html = html.replace(
+        "District of Columbia Department of Aging and Community Living</td>",
+        "District of Columbia Department of Aging and Community Living,</td>",
+        1,
+    )
+
+    rows = parse_certification_table(html, scraped_at="2026-07-14T00:00:00+00:00")
+
+    assert rows[0]["employer_name"] == (
+        "District of Columbia Department of Aging and Community Living"
+    )
