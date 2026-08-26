@@ -35,6 +35,7 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "certification_category",
     "employer_name",
     "union_name",
+    "unit_description",
     "jurisdiction_city",
     "jurisdiction_state",
     "employer_street",
@@ -47,6 +48,54 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "source_url",
     "scraped_at",
 )
+
+# Parentheticals that name a bargaining unit / job class, not a municipality.
+_UNIT_PAREN_HINT = re.compile(
+    r"(?i)\b("
+    r"clerical|custodial|nurse|nurses|housing|management|police|"
+    r"crossing|guard|guards|clerk|clerks|aide|aides|driver|drivers|"
+    r"secretary|secretaries|rescue|personnel|professional|non-?police|"
+    r"fire\s*fighter|teacher|teachers|maintenance|paraprofessional|"
+    r"hours?\s+per\s+week|middle\s+management"
+    r")\b"
+)
+
+
+def _split_employer_unit(employer_name: str) -> tuple[str, str]:
+    """Move unit descriptors out of employer_name into unit_description.
+
+    Listing cells often put `(Clerical)` or `(Clerks, Aides, …)` on the employer
+    column (infra-36). Keep place parentheticals like `(Lincoln)` / `(Scituate)`
+    and amendment notes on the employer string. Full PDF caption parse remains a
+    follow-on.
+    """
+    text = re.sub(r"\s+", " ", employer_name).strip()
+    if not text:
+        return "", ""
+
+    units: list[str] = []
+
+    def _maybe_peel(match: re.Match[str]) -> str:
+        paren = match.group(1).strip()
+        lower = paren.lower()
+        if lower.startswith("amended"):
+            return match.group(0)
+        if _UNIT_PAREN_HINT.search(paren) or "," in paren:
+            units.append(paren)
+            return " "
+        return match.group(0)
+
+    cleaned = re.sub(r"\(([^)]+)\)", _maybe_peel, text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;")
+    if not cleaned and units:
+        return "", "; ".join(units)
+    only = re.fullmatch(r"\(([^)]+)\)", text)
+    if only and not units:
+        # Whole cell was a single parenthetical with no unit hint — leave as-is
+        # only when it is clearly a unit-only cell (parens wrapping everything).
+        if _UNIT_PAREN_HINT.search(only.group(1)) or "," in only.group(1):
+            return "", only.group(1).strip()
+    return cleaned, "; ".join(units)
 
 def _normalize_case_number(value: str) -> str:
     return re.sub(r"\s+", "", value.strip().upper())
@@ -96,7 +145,8 @@ def _parse_certification_table(
         # post-</a> text left many cells empty, and the old fallback wrote the raw
         # href="…" attribute into employer_name (infra-36). Never use the href as
         # a display value.
-        employer_name = strip_html_text(employer_cell)
+        employer_raw = strip_html_text(employer_cell)
+        employer_name, unit_description = _split_employer_unit(employer_raw)
 
         union_name = strip_html_text(cells[2])
         date_certified, date_amended = _extract_dates(strip_html_text(cells[3]))
@@ -122,6 +172,7 @@ def _parse_certification_table(
                 "certification_category": category,
                 "employer_name": employer_name,
                 "union_name": union_name,
+                "unit_description": unit_description,
                 "jurisdiction_city": jurisdiction_city,
                 "jurisdiction_state": "RI",
                 "employer_street": "",
