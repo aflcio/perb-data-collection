@@ -76,7 +76,8 @@ _LABEL_STRIP = re.compile(
 )
 _SKIP_LINE = re.compile(
     r"CERTIFICATIONS OF|BARGAINING UNITS CERTIFIED|ILLINOIS LABOR RELATIONS|"
-    r"July 1,\s*\d{4}|Labor\s+Organization|Unit Description|"
+    r"CERTIFICATION OF VOLUNTARILY|AMENDMENT TO CERTIFICATIONS|"
+    r"REVOCATION OF PRIOR|July 1,\s*\d{4}|Labor\s+Organization|Unit Description|"
     r"^\s*Date\s+Prevailing|^\s*Case\s+Number\b",
     flags=re.I,
 )
@@ -172,11 +173,13 @@ def _heal(left: str, right: str) -> tuple[str, str]:
     if not right_stripped:
         return left, right
     first = right_stripped[0]
+    # Require a lowercase (or digit/apostrophe) continuation. Short alpha + uppercase
+    # wrongly glued "of" + "Police" → "ofPolice" when labor wrapped one glyph left.
     looks_split = (
         first.islower()
-        or first == "'"
+        or first in "'\u2019\u2018"
         or (frag.isdigit() and first.isdigit())
-        or (len(frag) <= 2 and frag.isalpha() and first.isalpha())
+        or (frag.endswith("/") and first.isdigit())  # date split: "8/" + "29/2013"
     )
     if not looks_split:
         return left, right
@@ -210,8 +213,10 @@ def detect_column_bounds(lines: list[str]) -> tuple[int, ...]:
 
     case_end = 20 if emp >= 24 else 12
     labor_start = labor if labor > 0 else max(emp + 15, 38)
-    if emp <= 20 and labor >= 38:
-        labor_start = 36  # FY26 vintage bleeds one glyph left of Labor header
+    # FY26/FY27: Labor header sits one-to-two glyphs right of the wrapped labor
+    # continuation ("of Police…"), so slice emp at 36 rather than header "Labor".
+    if emp <= 22 and labor >= 38:
+        labor_start = 36
     cert_start = cert if cert > 0 else labor_start + 25
     party_start = party if party > cert_start else cert_start + 12
     emps_start = emps if emps > party_start else party_start + 16
@@ -232,6 +237,17 @@ def detect_column_bounds(lines: list[str]) -> tuple[int, ...]:
         unit_start,
     )
 
+def _header_end_index(lines: list[str]) -> int:
+    """First content line after the column header (and title banners)."""
+    header_i = 0
+    for i, line in enumerate(lines[:20]):
+        if re.search(r"Case\s+(?:No\.?|Number)\b", line, re.I) and re.search(
+            r"Employer", line, re.I
+        ):
+            header_i = i + 1
+            break
+    return header_i
+
 def _split_blocks(lines: list[str]) -> list[tuple[list[str], list[str]]]:
     idxs = [
         i
@@ -240,10 +256,11 @@ def _split_blocks(lines: list[str]) -> list[tuple[list[str], list[str]]]:
     ]
     blocks: list[tuple[list[str], list[str]]] = []
     i = 0
+    preamble_start = _header_end_index(lines)
     while i < len(idxs):
-        start = idxs[i]
+        case_line = idxs[i]
         cases = [
-            _CASE_LINE_RE.match(lines[start].replace("\x0c", "")).group(1)  # type: ignore[union-attr]
+            _CASE_LINE_RE.match(lines[case_line].replace("\x0c", "")).group(1)  # type: ignore[union-attr]
         ]
         j = i + 1
         while j < len(idxs):
@@ -258,10 +275,72 @@ def _split_blocks(lines: list[str]) -> list[tuple[list[str], list[str]]]:
                 j += 1
                 continue
             break
+        # Include lines above the case number (wrapped employer/labor/party cells).
+        start = preamble_start if i == 0 else case_line
+        if i == 0 and case_line > preamble_start:
+            start = preamble_start
         end = idxs[j] if j < len(idxs) else len(lines)
-        blocks.append((cases, lines[start:end]))
+        # First block: from header through line before next case.
+        # Later blocks start at their case line; post-date carry moves preambles.
+        if i == 0:
+            blocks.append((cases, lines[start:end]))
+        else:
+            blocks.append((cases, lines[case_line:end]))
         i = j
     return blocks
+
+
+def _labor_name_incomplete(parts: list[str]) -> bool:
+    """True when wrapped labor still expects another line (ends in of/and/Int'l/…)."""
+    text = _clean(" ".join(parts))
+    if not text:
+        return True
+    # Explicitly complete: local/lodge number or "… Labor Council" / "Council 31".
+    if re.search(
+        r"(?i)(?:\b(?:Local|Lodge|Chapter)\s*#?\s*\d+\s*$|"
+        r"Labor Council\s*$|"
+        r"\bCouncil\s+\d+\s*$)",
+        text,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"of|and|the|Int['\u2019]?l|International|Association|Federation|"
+            r"Brotherhood|Alliance|Order|Employees|Union,"
+            r")\s*$",
+            text,
+        )
+    )
+
+
+def _strip_neighbor_bleed(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Remove next-case employer/union text glued onto the current row (infra-38)."""
+    for i in range(len(rows) - 1):
+        for field in ("employer_name", "union_name"):
+            cur = rows[i].get(field) or ""
+            nxt = rows[i + 1].get(field) or ""
+            if len(nxt) < 12 or not cur:
+                continue
+            idx = cur.find(nxt)
+            if idx > 0 and (cur[idx - 1].isspace() or cur[idx - 1] in ",;"):
+                rows[i][field] = cur[:idx].rstrip(" ,;")
+                continue
+            words = nxt.split()
+            if len(words) < 3:
+                continue
+            for take in range(len(words), 2, -1):
+                prefix = " ".join(words[:take])
+                if len(prefix) < 20:
+                    break
+                idx = cur.find(prefix)
+                if idx > 0 and (cur[idx - 1].isspace() or cur[idx - 1] in ",;"):
+                    rows[i][field] = cur[:idx].rstrip(" ,;")
+                    break
+        rows[i]["jurisdiction_city"] = _jurisdiction_city(
+            rows[i].get("employer_name") or ""
+        )[:80]
+    return rows
 
 def _normalize_date(raw: str) -> str:
     parts = raw.split("/")
@@ -332,7 +411,14 @@ def _heal_shredded_fields(
         # Strip date tokens out of the union string so matchers see the name.
         union = _DATE_RE.sub(" ", union)
         union = re.sub(r"(?<!\d)/\d{4}\b", " ", union)
+        # Mid-name shred left after a boundary split ("of 8/ Operating").
+        union = re.sub(r"(?<=\s)\d{1,2}/(?=\s|$|[A-Za-z])", " ", union)
         union = re.sub(r"\s+", " ", union).strip(" ,/")
+    else:
+        # Even without a recoverable date, drop lone m/ shreds from union text.
+        if re.search(r"(?<=\s)\d{1,2}/(?=\s|$|[A-Za-z])", union or ""):
+            union = re.sub(r"(?<=\s)\d{1,2}/(?=\s|$|[A-Za-z])", " ", union)
+            union = re.sub(r"\s+", " ", union).strip(" ,/")
 
     # Bare digits or shredded caption crumbs are not a prevailing party name.
     if party and (
@@ -370,12 +456,18 @@ def parse_certs_text(
     ) = bounds
 
     rows: list[dict[str, str]] = []
+    carry_emp: list[str] = []
+    carry_labor: list[str] = []
+    carry_party: list[str] = []
+    carry_case: list[str] = []
+
     for cases, block_lines in _split_blocks(lines):
-        emp_parts: list[str] = []
-        labor_parts: list[str] = []
-        party_parts: list[str] = []
+        emp_parts: list[str] = list(carry_emp)
+        labor_parts: list[str] = list(carry_labor)
+        party_parts: list[str] = list(carry_party)
+        case_bits: list[str] = list(carry_case)
+        carry_emp, carry_labor, carry_party, carry_case = [], [], [], []
         unit_parts: list[str] = []
-        case_bits: list[str] = []
         certified = ""
         date_line_employees = ""
 
@@ -396,34 +488,86 @@ def parse_certs_text(
 
             case_c, emp_c = _heal(case_c, emp_c)
             emp_c, lab_c = _heal(emp_c, lab_c)
+            # Heal labor→cert when a date is split across the boundary ("8/"|"29/2013").
             lab_c, cert_c = _heal(lab_c, cert_c)
+            date_in_cert = bool(_DATE_RE.search(cert_c)) or bool(
+                _DATE_RE.search(lab_c + cert_c)
+            )
+            if not date_in_cert:
+                cert_c, party_c = _heal(cert_c, party_c)
             emps_c, unit_c = _heal(emps_c, unit_c)
 
-            bit = _CASE_RE.sub("", case_c)
-            bit = _LABEL_STRIP.sub(" ", bit)
-            bit = re.sub(r"^\s*and\s*$", "", bit, flags=re.I)
+            def _case_bit(cell: str) -> str:
+                bit = _CASE_RE.sub("", cell)
+                bit = _LABEL_STRIP.sub(" ", bit)
+                return re.sub(r"^\s*and\s*$", "", bit, flags=re.I)
+
+            # After the date line: keep collecting while the labor name is still
+            # incomplete (FY14 "Int'l Union of" → "Operating Engineers"). Once
+            # complete, emp/labor/party lines are the next case's preamble.
+            if certified:
+                if _labor_name_incomplete(labor_parts):
+                    bit = _case_bit(case_c)
+                    if bit.strip() and not re.search(
+                        r"(?i)Majority|Interest|Amended|Election", bit
+                    ):
+                        case_bits.append(bit)
+                    if emp_c.strip() and not re.search(
+                        r"(?i)Majority|Interest", emp_c
+                    ):
+                        emp_parts.append(emp_c)
+                    if lab_c.strip():
+                        labor_parts.append(lab_c)
+                    if party_c.strip() and not party_c.strip().isdigit():
+                        party_parts.append(party_c)
+                    if unit_c.strip():
+                        unit_parts.append(unit_c)
+                    continue
+                if emp_c.strip() or lab_c.strip() or party_c.strip() or _case_bit(
+                    case_c
+                ).strip():
+                    bit = _case_bit(case_c)
+                    if bit.strip():
+                        carry_case.append(bit)
+                    if emp_c.strip():
+                        carry_emp.append(emp_c)
+                    if lab_c.strip():
+                        carry_labor.append(lab_c)
+                    if party_c.strip():
+                        carry_party.append(party_c)
+                    continue
+                if unit_c.strip():
+                    unit_parts.append(unit_c)
+                continue
+
+            bit = _case_bit(case_c)
             if bit.strip():
                 case_bits.append(bit)
             if emp_c.strip():
                 emp_parts.append(emp_c)
             if lab_c.strip():
                 labor_parts.append(lab_c)
-            if party_c.strip():
-                party_parts.append(party_c)
             if unit_c.strip():
                 unit_parts.append(unit_c)
 
             date_match = (
                 _DATE_RE.search(cert_c)
+                or _DATE_RE.search(lab_c + cert_c)
                 or _DATE_RE.search(cert_c + party_c)
+                or _DATE_RE.search(lab_c + cert_c + party_c)
                 or _DATE_RE.search(lab_c)
                 or _DATE_RE.search(party_c)
             )
-            if date_match and not certified:
+            if date_match:
                 certified = _normalize_date(date_match.group(1))
                 date_line_employees = emps_c
-                if party_c.strip():
-                    party_parts = [party_c] + [p for p in party_parts if p != party_c]
+                # Leftover after the date is the end of the party wrap ("Council").
+                leftover = _DATE_RE.sub(" ", cert_c + " " + party_c)
+                leftover = re.sub(r"\s+", " ", leftover).strip(" ,")
+                if leftover and re.search(r"(?i)[A-Za-z]{3,}", leftover):
+                    party_parts.append(leftover)
+            elif party_c.strip():
+                party_parts.append(party_c)
 
         employer = _clean(" ".join(case_bits + emp_parts))
         union = _clean(" ".join(labor_parts))
@@ -465,6 +609,17 @@ def parse_certs_text(
             union=union,
             party=party,
         )
+        # On FY26+ PDFs the Prevailing Party column is a wrapped duplicate of
+        # Labor Organization and shreds under fixed bounds. Prefer the assembled
+        # union when it is a real name; keep a short acronym party (FOP, AFSCME)
+        # from older FYs when union is empty or weaker.
+        if union and re.search(r"(?i)[A-Za-z]{3,}", union):
+            if (
+                not party
+                or len(union) >= len(party)
+                or not re.search(r"(?i)[A-Za-z]{3,}", party)
+            ):
+                party = union[:80]
 
         case_number = "+".join(cases)
         rows.append(
@@ -492,7 +647,8 @@ def parse_certs_text(
                 "scraped_at": scraped_at,
             }
         )
-    return rows
+
+    return _strip_neighbor_bleed(rows)
 
 def scrape_bargaining_certs(
     *,
