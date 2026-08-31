@@ -7,8 +7,9 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin
 
-from perb_data_collection.http import fetch_url, strip_html_text
+from perb_data_collection.http import fetch_url, fetch_bytes, strip_html_text
 from perb_data_collection.csv_io import write_wide_csv
+from perb_data_collection.pdf import pdf_bytes_to_text
 
 FLOW_NAME = "RISLRB Certifications Flow"
 REPORT_PREFIX = "rislrb_certifications"
@@ -60,14 +61,39 @@ _UNIT_PAREN_HINT = re.compile(
     r")\b"
 )
 
+# Caption structure is stable; OCR of typescript is not (Flre, chlef, Bul1dlng).
+# Match roles loosely: MATTER/MATER, Employer/Emp1oyer, Petitioner/Pet1tioner.
+_CAPTION_RE = re.compile(
+    r"In\s+the\s+M\w{3,6}\s+of\s+(?P<employer>.+?)\s+"
+    r"Emp\w{3,10}\s*-+\s*and\s*-+\s*(?P<union>.+?)\s+"
+    r"Pet\w{5,12}",
+    flags=re.I | re.S,
+)
+_UNIT_BALLOT_RE = re.compile(
+    r"(?:secret\s+ballot\s+of|by\s+secret\s+ballot\s+of)\s+"
+    r"(?P<unit>.+?)(?:\.\s|\.\n|$)",
+    flags=re.I | re.S,
+)
+_CITY_OF_RE = re.compile(
+    r"\b(?:City|Town|Village)\s+of\s+(?P<city>[A-Za-z][A-Za-z .'-]{0,40})",
+    flags=re.I,
+)
+_NON_PLACE_EMPLOYER_RE = re.compile(
+    r"(?i)\b("
+    r"state|quasi|authority|university|college|school\s+department|"
+    r"school\s+committee|board\s+of|department\s+of|fire\s+district|"
+    r"water\s+district|housing\s+authority|transit|airport"
+    r")\b"
+)
+
 
 def _split_employer_unit(employer_name: str) -> tuple[str, str]:
     """Move unit descriptors out of employer_name into unit_description.
 
     Listing cells often put `(Clerical)` or `(Clerks, Aides, …)` on the employer
     column (infra-36). Keep place parentheticals like `(Lincoln)` / `(Scituate)`
-    and amendment notes on the employer string. Full PDF caption parse remains a
-    follow-on.
+    and amendment notes on the employer string. PDF caption parse fills city and
+    can refine employer/union when the listing is thin.
     """
     text = re.sub(r"\s+", " ", employer_name).strip()
     if not text:
@@ -114,6 +140,101 @@ def _extract_dates(date_cell: str) -> tuple[str, str]:
         amended = ""
     return primary, amended
 
+
+def _clean_caption_party(value: str) -> str:
+    text = re.sub(r"\s+", " ", value).strip(" ,;-")
+    text = re.sub(r"\s*-\s*and\s*-?\s*$", "", text, flags=re.I).strip(" ,;-")
+    return text
+
+
+def jurisdiction_city_from_employer(employer_name: str) -> str:
+    """Return a city only when the employer string explicitly encodes one.
+
+    Do not invent cities for state / quasi-state / district / school employers
+    (infra-36 city half). Prefer ``City/Town/Village of X``, then a place
+    parenthetical, then a bare municipal name with no non-place tokens.
+    """
+    text = re.sub(r"\s+", " ", employer_name).strip()
+    if not text:
+        return ""
+
+    city_of = _CITY_OF_RE.search(text)
+    if city_of:
+        return city_of.group("city").strip(" ,.")
+
+    place_paren = re.search(r"\(([A-Za-z][A-Za-z .'-]{0,40})\)\s*$", text)
+    if place_paren and not _UNIT_PAREN_HINT.search(place_paren.group(1)):
+        inner = place_paren.group(1).strip()
+        if not _NON_PLACE_EMPLOYER_RE.search(inner):
+            return inner
+
+    bare = re.sub(r"\s*\([^)]*\)\s*", " ", text).strip(" ,;")
+    if not bare or _NON_PLACE_EMPLOYER_RE.search(bare):
+        return ""
+    if _UNIT_PAREN_HINT.search(bare):
+        return ""
+    # Single-token or short municipal names from the listing (Barrington, Bristol).
+    if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{0,40}", bare) and len(bare.split()) <= 3:
+        return bare
+    return ""
+
+
+def parse_certification_caption(text: str) -> dict[str, str]:
+    """Extract employer, union, unit, and city from certification PDF text.
+
+    Returns empty strings for fields that cannot be recovered. Tolerates OCR
+    character errors by matching caption structure rather than exact words.
+    """
+    flat = re.sub(r"[ \t]+", " ", text)
+    flat = re.sub(r"\n+", "\n", flat)
+    out = {
+        "employer_name": "",
+        "union_name": "",
+        "unit_description": "",
+        "jurisdiction_city": "",
+    }
+    caption = _CAPTION_RE.search(flat)
+    if caption:
+        employer = _clean_caption_party(caption.group("employer"))
+        union = _clean_caption_party(caption.group("union"))
+        out["employer_name"] = employer
+        out["union_name"] = union
+        out["jurisdiction_city"] = jurisdiction_city_from_employer(employer)
+
+    unit_match = _UNIT_BALLOT_RE.search(flat)
+    if unit_match:
+        unit = re.sub(r"\s+", " ", unit_match.group("unit")).strip(" .;")
+        # Cap runaway matches from a missing period.
+        if len(unit) > 400:
+            unit = unit[:400].rsplit(" ", 1)[0]
+        out["unit_description"] = unit
+    return out
+
+
+def _enrich_row_from_caption(row: dict[str, str], caption: dict[str, str]) -> None:
+    """Merge PDF caption fields into a listing row (soft overwrite)."""
+    if caption.get("employer_name"):
+        # Prefer caption employer when listing was empty or unit-only.
+        listing_emp = row.get("employer_name", "").strip()
+        if not listing_emp or listing_emp.startswith("("):
+            row["employer_name"] = caption["employer_name"]
+        elif len(caption["employer_name"]) > len(listing_emp) + 5:
+            # Caption usually carries the full municipal form ("City of …").
+            row["employer_name"] = caption["employer_name"]
+    if caption.get("union_name"):
+        listing_union = row.get("union_name", "").strip()
+        if not listing_union or len(caption["union_name"]) > len(listing_union) + 5:
+            row["union_name"] = caption["union_name"]
+    if caption.get("unit_description") and not row.get("unit_description"):
+        row["unit_description"] = caption["unit_description"]
+    if caption.get("jurisdiction_city"):
+        row["jurisdiction_city"] = caption["jurisdiction_city"]
+    elif row.get("employer_name"):
+        city = jurisdiction_city_from_employer(row["employer_name"])
+        if city:
+            row["jurisdiction_city"] = city
+
+
 def _parse_certification_table(
     html: str,
     *,
@@ -159,9 +280,9 @@ def _parse_certification_table(
         canonical = "UNIT_CLARIFICATION" if disposition_pdf else "CERTIFICATION"
         row_key = f"{AGENCY_CODE}:{case_key}:{category}"
 
-        # Listing pages do not state a reliable city; deriving city from
-        # employer_name leaked href= markup and unit descriptors into ACE.
-        jurisdiction_city = ""
+        # Listing pages do not state a reliable city. Prefer PDF caption (below);
+        # fall back to an explicit municipal form on the employer string only.
+        jurisdiction_city = jurisdiction_city_from_employer(employer_name)
         rows.append(
             {
                 "row_key": row_key,
@@ -188,12 +309,49 @@ def _parse_certification_table(
         )
     return rows
 
+
+def enrich_rows_from_certification_pdfs(
+    rows: list[dict[str, str]],
+    *,
+    delay_seconds: float = 0.3,
+    fetch_pdf: Any = None,
+    pdf_to_text: Any = None,
+) -> list[dict[str, str]]:
+    """Fetch each certification PDF and merge caption fields (soft-fail per row)."""
+    pdf_fetcher = fetch_pdf or fetch_bytes
+    to_text = pdf_to_text or pdf_bytes_to_text
+    for row in rows:
+        url = row.get("certification_pdf_url") or ""
+        if not url:
+            if row.get("employer_name") and not row.get("jurisdiction_city"):
+                city = jurisdiction_city_from_employer(row["employer_name"])
+                if city:
+                    row["jurisdiction_city"] = city
+            continue
+        try:
+            pdf_bytes = pdf_fetcher(url, delay_seconds=delay_seconds)
+            text = to_text(pdf_bytes)
+            caption = parse_certification_caption(text)
+            _enrich_row_from_caption(row, caption)
+        except Exception:
+            # Keep the listing row; one bad PDF must not abort the feed.
+            if row.get("employer_name") and not row.get("jurisdiction_city"):
+                city = jurisdiction_city_from_employer(row["employer_name"])
+                if city:
+                    row["jurisdiction_city"] = city
+            continue
+    return rows
+
+
 def scrape_certifications(
     *,
     delay_seconds: float = 0.3,
     fetch_html: Any = None,
+    fetch_pdf: Any = None,
+    pdf_to_text: Any = None,
+    enrich_pdfs: bool = True,
 ) -> list[dict[str, str]]:
-    """Scrape all RISLRB certification category tables."""
+    """Scrape all RISLRB certification category tables, then PDF captions."""
     fetcher = fetch_html or fetch_url
     scraped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     all_rows: list[dict[str, str]] = []
@@ -213,10 +371,17 @@ def scrape_certifications(
             seen_keys.add(row["row_key"])
             all_rows.append(row)
 
+    if enrich_pdfs:
+        enrich_rows_from_certification_pdfs(
+            all_rows,
+            delay_seconds=delay_seconds,
+            fetch_pdf=fetch_pdf,
+            pdf_to_text=pdf_to_text,
+        )
+
     all_rows.sort(key=lambda row: (row["case_number"], row["certification_category"]))
     return all_rows
 
 def scrape_to_wide_csv(csv_path: Any, *, delay_seconds: float = 0.3) -> int:
     rows = scrape_certifications(delay_seconds=delay_seconds)
     return write_wide_csv(rows, csv_path, fieldnames=WIDE_FIELDNAMES)
-
