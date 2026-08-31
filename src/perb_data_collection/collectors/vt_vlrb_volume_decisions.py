@@ -60,6 +60,18 @@ _NAME_RE = re.compile(
     r"^(?P<vol>\d+)-(?P<page>\d+(?:-\d+)?)\s*(?P<rest>.*?)(?:\.pdf)?$",
     flags=re.I,
 )
+# Filenames often encode grievances as "Gr. of <tail>". When <tail> is a
+# surname, putting it in union_name mislabels a private individual as a union
+# (infra-35). Keep only tails that look like real bargaining agents.
+_GR_OF_RE = re.compile(r"^Gr\.?\s+of\s+(?P<tail>.+)$", flags=re.I)
+_UNIONISH_RE = re.compile(
+    r"\b("
+    r"VSEA|VSCFF|AFSCME|IBEW|NEA|AFT|CWA|IAFF|SEIU|UE|NAGE|"
+    r"Teamsters|Local\s+\d+|Council\s+\d+|"
+    r"Ass(?:ocia)?(?:'?n|tion)|Union|Federation|Guild|Brotherhood"
+    r")\b",
+    flags=re.I,
+)
 
 def _absolute_url(href: str) -> str:
     return urljoin(BASE_URL + "/", href)
@@ -83,12 +95,20 @@ def list_volume_zips(html: str) -> list[tuple[str, str, str]]:
     found.sort(key=lambda item: int(item[0]))
     return found
 
+def _looks_like_union(name: str) -> bool:
+    return bool(_UNIONISH_RE.search(name))
+
 def _parties_from_rest(rest: str) -> tuple[str, str]:
     text = rest.strip()
     text = re.sub(r"\s+", " ", text)
-    # Grievance filings
-    if re.match(r"Gr\.?\s+of\b", text, flags=re.I):
-        return "State of Vermont", text
+    # Grievance filings — caption stays in document_title; union only when
+    # the grievant-side string is actually a union (e.g. "Gr. of VSEA").
+    gr_match = _GR_OF_RE.match(text)
+    if gr_match:
+        tail = gr_match.group("tail").strip()
+        if _looks_like_union(tail):
+            return "State of Vermont", text
+        return "State of Vermont", ""
     for sep in (" v. ", " v ", " and "):
         if sep in text:
             left, right = text.split(sep, 1)
