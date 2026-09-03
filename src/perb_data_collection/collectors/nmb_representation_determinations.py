@@ -123,9 +123,16 @@ def parse_determinations_table(html: str, *, source_page_url: str, scraped_at: s
         if not primary_case_number or not craft_class:
             continue
         page_cite, pdf_href = _cell(raw, indexes, "pagecite")
-        row_key = f"{AGENCY_CODE}:{_key_part(primary_case_number)}:{_key_part(craft_class)}"
-        if row_key in seen:
-            row_key = f"{row_key}:{_key_part(page_cite)}"
+        # NMB can issue more than one determination for the same case and
+        # craft.  The Board's volume/page cite and determination date
+        # distinguish those events; fiscal-year pages are only an index, not
+        # the source grain.
+        determination_date, _ = _cell(raw, indexes, "date")
+        row_key = (
+            f"{AGENCY_CODE}:{_key_part(primary_case_number)}:"
+            f"{_key_part(craft_class)}:{_key_part(page_cite)}:"
+            f"{_key_part(determination_date)}"
+        )
         if row_key in seen:
             raise RuntimeError(f"Duplicate NMB determination row key: {row_key}")
         seen.add(row_key)
@@ -137,7 +144,7 @@ def parse_determinations_table(html: str, *, source_page_url: str, scraped_at: s
             "canonical_case_type": _canonical_case_type(disposition), "native_case_type": disposition,
             "employer_name": _cell(raw, indexes, "carrier")[0], "union_name": _cell(raw, indexes, "union")[0],
             "craft_class": craft_class, "nmb_volume_number": _cell(raw, indexes, "nmbnumber")[0],
-            "page_cite": page_cite, "determination_date": _cell(raw, indexes, "date")[0],
+            "page_cite": page_cite, "determination_date": determination_date,
             "fiscal_year": fiscal_year,
             "jurisdiction_city": "", "jurisdiction_state": "", "employer_street": "", "employer_zip": "",
             "source_page_url": source_page_url,
