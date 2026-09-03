@@ -26,6 +26,7 @@ Run any shipped collector: `perb-collect <slug> --out ./out` (see `perb-collect 
 | Jurisdiction | Agency | Status | Collector slug | Notes | Plan |
 |--------------|--------|--------|----------------|-------|------|
 | Ohio | SERB | planned | — | Public CBA DataTable ~29,403 rows (browser OK; curl often 404). Top remaining candidate. | [oh-serb-clearinghouse.md](agencies/oh-serb-clearinghouse.md) |
+| **Federal (RLA)** | **NMB** | collector_shipped | `nmb-representation-determinations` | Airline/railroad representation determinations, 1998–FY2026 HTML tables (carrier + union + craft/class). Only representation authority for RLA carriers; NLRA does not reach them. | [nmb-representation-determinations.md](agencies/nmb-representation-determinations.md) |
 | Washington | PERC | collector_shipped | `wa-perc-certifications` | Pending-representation listing. Decisia historical cert search still CAPTCHA. | [wa-perc-certifications.md](agencies/wa-perc-certifications.md) |
 | Massachusetts | DLR/CERB | not_started | — | Employer autocomplete (~1,096 names); no bulk cert list. | [ma-dlr-certifications.md](agencies/ma-dlr-certifications.md) |
 | Michigan | MERC | blocked | — | Year cert PDFs image-scan historically; re-probe 2024–2026 with `pdftotext` before any OCR chase. | [mi-merc-certifications.md](agencies/mi-merc-certifications.md) |
@@ -84,5 +85,6 @@ Representation-focused backlog (2026-08-26): [representation-gaps-2026-08-26.md]
 
 1. **OH SERB** CBA archive oneshot (~29k structured rows: employer + union + unit).
 2. **NJ** Contracts-by-Employer research POC (IssuedDecisions is not representation-ready).
-3. **MI** soft `pdftotext` re-probe on 2024–2026 year cert PDFs; build only if text recovers. Leave CT/MT blocked.
-4. Optional: MA employer-walk cert POC; IN only if education scope is wanted. NH/FL/MN browser refresh when stale (already oneshot corpora).
+3. **NMB** airline/railroad determinations collector (plain HTTP, stable tables, unique sector — no other feed covers RLA carriers).
+4. **MI** soft `pdftotext` re-probe on 2024–2026 year cert PDFs; build only if text recovers. Leave CT/MT blocked.
+5. Optional: MA employer-walk cert POC; IN only if education scope is wanted. NH/FL/MN browser refresh when stale (already oneshot corpora).
