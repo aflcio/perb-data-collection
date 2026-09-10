@@ -10,9 +10,11 @@ from pathlib import Path
 
 from perb_data_collection.collectors.fl_perc_certifications import (
     WIDE_FIELDNAMES,
+    _fetch_grid_html,
     classify_dossier_text,
     dossier_columns,
     parse_certification_table,
+    read_dossiers,
     scrape_certifications,
 )
 from test_pdf_probe import make_image_only_pdf, make_text_pdf
@@ -193,7 +195,7 @@ def test_scrape_certifications_reads_dossiers_and_tolerates_a_failure() -> None:
         name = url.rsplit("File=", 1)[-1]
         attempts[name] = attempts.get(name, 0) + 1
         if name not in pdfs:
-            raise RuntimeError(f"HTTP 500 fetching {url}")
+            raise TimeoutError(f"HTTP 500 fetching {url}")
         return pdfs[name]
 
     def fake_pdf_to_text(data: bytes, **_kwargs: object) -> str:
@@ -211,6 +213,7 @@ def test_scrape_certifications_reads_dossiers_and_tolerates_a_failure() -> None:
         read_documents=True,
         fetch_pdf=fake_fetch_pdf,
         pdf_to_text=fake_pdf_to_text,
+        sleep=lambda _seconds: None,
     )
 
     assert [row["certification_number"] for row in rows] == ["1", "2", "3"]
@@ -250,3 +253,140 @@ def test_scrape_certifications_can_skip_the_dossier_pass() -> None:
         fetch_pdf=never_fetch,
     )
     assert all(row["certification_status"] == "" for row in rows)
+
+
+# --- retrying grid fetch ---------------------------------------------------
+
+
+def test_fetch_grid_html_retries_then_succeeds() -> None:
+    calls: list[float] = []
+    attempts: list[int] = []
+
+    def flaky_fetch(url: str, *, delay_seconds: float, timeout: int) -> str:
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            raise TimeoutError("The read operation timed out")
+        return GRID_HTML
+
+    html = _fetch_grid_html(
+        flaky_fetch,
+        "https://perc.myflorida.com/co/certResults.aspx?Union=a",
+        delay_seconds=0,
+        timeout_seconds=600,
+        attempts=3,
+        sleep=calls.append,
+    )
+
+    rows = parse_certification_table(html, scraped_at="2026-09-10T00:00:00+00:00")
+    assert len(rows) == 3
+    assert len(attempts) == 3
+    assert all(t == 600 for t in attempts)
+    assert calls == [5, 20]
+
+
+def test_fetch_grid_html_raises_after_exhausting_attempts() -> None:
+    sleeps: list[float] = []
+    url = "https://perc.myflorida.com/co/certResults.aspx?Union=a"
+
+    def always_times_out(url: str, *, delay_seconds: float, timeout: int) -> str:
+        raise TimeoutError("The read operation timed out")
+
+    try:
+        _fetch_grid_html(
+            always_times_out,
+            url,
+            delay_seconds=0,
+            timeout_seconds=600,
+            attempts=3,
+            sleep=sleeps.append,
+        )
+        raise AssertionError("expected _fetch_grid_html to raise")
+    except RuntimeError as exc:
+        assert url in str(exc)
+        assert "3 attempts" in str(exc)
+
+    assert sleeps == [5, 20]
+
+
+def test_scrape_certifications_bulk_query_failure_is_fatal() -> None:
+    def always_times_out(url: str, **_kwargs: object) -> str:
+        raise TimeoutError("The read operation timed out")
+
+    try:
+        scrape_certifications(
+            delay_seconds=0,
+            fetch_html=always_times_out,
+            bulk_queries=(("Union", "a"),),
+            gap_probe_ahead=0,
+            min_expected_rows=1,
+            read_documents=False,
+            sleep=lambda _seconds: None,
+        )
+        raise AssertionError("expected the bulk-query failure to propagate")
+    except RuntimeError as exc:
+        assert "Union=a" in str(exc)
+
+
+def test_scrape_certifications_skips_a_failing_gap_fill_cert_and_continues(
+    caplog: object,
+) -> None:
+    # Bulk query returns certs 1 and 3 only (2 is "missing" and needs gap-fill).
+    bulk_html = (
+        '<html><body><table id="gridCases">'
+        "<tr><th>Cert</th><th>Union</th><th>Employer</th><th>Doc</th></tr>"
+        + _grid_row(1, "AFSCME Florida Council 79", "City of Example, Florida")
+        + _grid_row(3, "IAFF Local 2000", "City of Third, Florida")
+        + "</table></body></html>"
+    )
+    gap_fill_html = (
+        '<html><body><table id="gridCases">'
+        "<tr><th>Cert</th><th>Union</th><th>Employer</th><th>Doc</th></tr>"
+        + _grid_row(2, "Teamsters Local 385", "County of Demo, Florida")
+        + "</table></body></html>"
+    )
+
+    def fake_fetch_html(url: str, **_kwargs: object) -> str:
+        if "Union=a" in url or "Employer=" in url:
+            return bulk_html
+        if "CertNo=2" in url:
+            raise TimeoutError("The read operation timed out")
+        return gap_fill_html
+
+    rows = scrape_certifications(
+        delay_seconds=0,
+        fetch_html=fake_fetch_html,
+        bulk_queries=(("Union", "a"),),
+        gap_probe_ahead=0,
+        min_expected_rows=1,
+        read_documents=False,
+        grid_attempts=2,
+        sleep=lambda _seconds: None,
+    )
+
+    cert_numbers = {row["certification_number"] for row in rows}
+    assert cert_numbers == {"1", "3"}
+    assert getattr(scrape_certifications, "skipped_cert_numbers", None) == [2]
+
+
+def test_read_dossiers_fetch_failing_twice_leaves_columns_empty() -> None:
+    row = {
+        "certification_number": "9",
+        "certification_pdf_url": "https://perc.myflorida.com/co/viewdoc.aspx?File=cert9.pdf",
+    }
+
+    def always_times_out(url: str, **_kwargs: object) -> bytes:
+        raise TimeoutError("The read operation timed out")
+
+    stats = read_dossiers(
+        [row],
+        fetch_pdf=always_times_out,
+        delay_seconds=0,
+        attempts=2,
+        sleep=lambda _seconds: None,
+    )
+
+    assert stats["failures"] == 1
+    assert stats["pdfs_fetched"] == 0
+    assert row.get("is_image_only", "") == ""
+    assert row.get("text_chars", "") == ""
+    assert row.get("certification_status", "") == ""
