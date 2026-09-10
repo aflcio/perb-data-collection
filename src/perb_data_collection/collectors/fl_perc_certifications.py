@@ -20,11 +20,16 @@ are assumed able to reach it.
 
 from __future__ import annotations
 
+import http.client
+import inspect
 import logging
 import re
+import socket
+import time
+import urllib.error
 from datetime import UTC, date, datetime
 from html import unescape
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, unquote
 
 from perb_data_collection.http import fetch_bytes, fetch_url, strip_html_text
@@ -49,6 +54,92 @@ BULK_QUERIES: tuple[tuple[str, str], ...] = (
 
 # How far past observed max(cert) to probe with CertNo= GETs.
 GAP_PROBE_AHEAD = 50
+
+# perc.myflorida.com renders large ASP.NET grids slowly and sometimes stalls;
+# the bulk Union=/Employer= queries need a much longer timeout than the
+# default fetch_url/fetch_bytes 120s, plus a retry with backoff.
+GRID_TIMEOUT_SECONDS = 600
+GRID_ATTEMPTS = 3
+_GRID_BACKOFF_SECONDS: tuple[float, ...] = (5, 20, 60)
+
+# The dossier PDF fetch is a single small file; fail faster and retry less.
+DOSSIER_TIMEOUT_SECONDS = 180
+DOSSIER_ATTEMPTS = 2
+_DOSSIER_BACKOFF_SECONDS: tuple[float, ...] = (2.0,)
+
+_RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    socket.timeout,
+    urllib.error.URLError,
+    http.client.HTTPException,
+    ConnectionError,
+)
+
+
+def _accepts_timeout_kwarg(fetcher: Callable[..., Any]) -> bool:
+    """Best-effort check for whether ``fetcher`` takes a ``timeout=`` kwarg."""
+    try:
+        signature = inspect.signature(fetcher)
+    except (TypeError, ValueError):
+        # Builtins / C callables without an introspectable signature: assume
+        # yes and let the TypeError fallback in `_fetch_grid_html` handle it.
+        return True
+    parameters = signature.parameters
+    if "timeout" in parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+def _fetch_grid_html(
+    fetcher: Callable[..., Any],
+    url: str,
+    *,
+    delay_seconds: float,
+    timeout_seconds: int = GRID_TIMEOUT_SECONDS,
+    attempts: int = GRID_ATTEMPTS,
+    backoff_seconds: tuple[float, ...] = _GRID_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Call ``fetcher(url, ...)`` with a long timeout and retry/backoff.
+
+    Passes ``timeout=timeout_seconds`` to ``fetcher`` when it accepts one
+    (checked via signature inspection, with a ``TypeError`` fallback for
+    fetchers whose signature cannot be introspected). Retries on timeouts and
+    other transient network errors, sleeping ``backoff_seconds[attempt]``
+    (clamped to the last entry) between attempts. Re-raises after the last
+    attempt with a message naming the URL and the attempt count.
+    """
+    supports_timeout = _accepts_timeout_kwarg(fetcher)
+    last_exc: BaseException | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if supports_timeout:
+                try:
+                    return fetcher(url, delay_seconds=delay_seconds, timeout=timeout_seconds)
+                except TypeError:
+                    # Signature check said yes but the call itself rejected
+                    # `timeout`; fall back for this and all later attempts.
+                    supports_timeout = False
+                    return fetcher(url, delay_seconds=delay_seconds)
+            return fetcher(url, delay_seconds=delay_seconds)
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            if attempt < attempts:
+                backoff = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+                logger.warning(
+                    "FL PERC fetch failed (attempt %s/%s) for %s: %s; retrying in %ss",
+                    attempt,
+                    attempts,
+                    url,
+                    exc,
+                    backoff,
+                )
+                sleep(backoff)
+
+    raise RuntimeError(
+        f"FL PERC fetch failed for {url} after {attempts} attempts: {last_exc}"
+    ) from last_exc
 
 # Sanity floor: Union=a alone returned ~2,175 rows in the 2026-07-19 research pass.
 MIN_EXPECTED_ROWS = 1500
@@ -381,6 +472,9 @@ def read_dossiers(
     fetch_pdf: Any = None,
     pdf_to_text: Any = None,
     delay_seconds: float = 0.25,
+    timeout_seconds: int = DOSSIER_TIMEOUT_SECONDS,
+    attempts: int = DOSSIER_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, int]:
     """Fetch and classify each row's dossier PDF, in place.
 
@@ -415,19 +509,25 @@ def read_dossiers(
             continue
 
         data: bytes | None = None
-        for attempt in (1, 2):
-            try:
-                data = fetcher(url, delay_seconds=delay_seconds)
-                break
-            except Exception as exc:  # noqa: BLE001 - one bad PDF must not end the run
-                if attempt == 2:
-                    logger.warning(
-                        "FL PERC dossier fetch failed twice for cert %s (%s): %s",
-                        row.get("certification_number", "?"),
-                        url,
-                        exc,
-                    )
-                    data = None
+        try:
+            data = _fetch_grid_html(
+                fetcher,
+                url,
+                delay_seconds=delay_seconds,
+                timeout_seconds=timeout_seconds,
+                attempts=attempts,
+                backoff_seconds=_DOSSIER_BACKOFF_SECONDS,
+                sleep=sleep,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad PDF must not end the run
+            logger.warning(
+                "FL PERC dossier fetch failed after %s attempts for cert %s (%s): %s",
+                attempts,
+                row.get("certification_number", "?"),
+                url,
+                exc,
+            )
+            data = None
 
         if data is None:
             stats["failures"] += 1
@@ -472,11 +572,24 @@ def scrape_certifications(
     read_documents: bool = True,
     fetch_pdf: Any = None,
     pdf_to_text: Any = None,
+    grid_timeout_seconds: int = GRID_TIMEOUT_SECONDS,
+    grid_attempts: int = GRID_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> list[dict[str, str]]:
-    """Scrape FL PERC certifications via bulk substring GETs + CertNo gap fill."""
+    """Scrape FL PERC certifications via bulk substring GETs + CertNo gap fill.
+
+    The bulk queries and CertNo probes go through ``_fetch_grid_html``, which
+    retries transient failures (perc.myflorida.com renders slowly and
+    sometimes stalls) with a long timeout and backoff. A bulk query failure
+    after all attempts is fatal to the run — those pages are how the bulk of
+    the certifications are found. A gap-fill or past-max probe failure is not:
+    it is logged and the certification number is skipped so the run
+    continues.
+    """
     fetcher = fetch_html or fetch_url
     scraped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     by_cert: dict[str, dict[str, str]] = {}
+    skipped_cert_numbers: list[int] = []
 
     for field, value in bulk_queries:
         if field == "Union":
@@ -485,7 +598,14 @@ def scrape_certifications(
             url = _results_url(union="", employer=value)
         else:
             raise ValueError(f"Unknown bulk query field: {field}")
-        html = fetcher(url, delay_seconds=delay_seconds)
+        html = _fetch_grid_html(
+            fetcher,
+            url,
+            delay_seconds=delay_seconds,
+            timeout_seconds=grid_timeout_seconds,
+            attempts=grid_attempts,
+            sleep=sleep,
+        )
         _merge_rows(by_cert, parse_certification_table(html, scraped_at=scraped_at, source_page_url=url))
 
     if len(by_cert) < min_expected_rows:
@@ -500,14 +620,51 @@ def scrape_certifications(
 
     for cert_no in missing:
         url = _results_url(cert_no=cert_no)
-        html = fetcher(url, delay_seconds=delay_seconds)
+        try:
+            html = _fetch_grid_html(
+                fetcher,
+                url,
+                delay_seconds=delay_seconds,
+                timeout_seconds=grid_timeout_seconds,
+                attempts=grid_attempts,
+                sleep=sleep,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad cert must not end the run
+            logger.warning(
+                "FL PERC gap-fill probe failed for CertNo=%s after %s attempts: %s",
+                cert_no,
+                grid_attempts,
+                exc,
+            )
+            skipped_cert_numbers.append(cert_no)
+            continue
         _merge_rows(by_cert, parse_certification_table(html, scraped_at=scraped_at, source_page_url=url))
 
     # Probe past the current max for newly issued certification numbers.
     consecutive_empty = 0
     for cert_no in range(max_cert + 1, max_cert + gap_probe_ahead + 1):
         url = _results_url(cert_no=cert_no)
-        html = fetcher(url, delay_seconds=delay_seconds)
+        try:
+            html = _fetch_grid_html(
+                fetcher,
+                url,
+                delay_seconds=delay_seconds,
+                timeout_seconds=grid_timeout_seconds,
+                attempts=grid_attempts,
+                sleep=sleep,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad cert must not end the run
+            logger.warning(
+                "FL PERC past-max probe failed for CertNo=%s after %s attempts: %s",
+                cert_no,
+                grid_attempts,
+                exc,
+            )
+            skipped_cert_numbers.append(cert_no)
+            consecutive_empty += 1
+            if consecutive_empty >= 10:
+                break
+            continue
         new_rows = parse_certification_table(html, scraped_at=scraped_at, source_page_url=url)
         if not new_rows:
             consecutive_empty += 1
@@ -516,6 +673,15 @@ def scrape_certifications(
             continue
         consecutive_empty = 0
         _merge_rows(by_cert, new_rows)
+
+    if skipped_cert_numbers:
+        logger.warning(
+            "FL PERC scrape skipped %s certification number(s) after repeated fetch "
+            "failures: %s",
+            len(skipped_cert_numbers),
+            skipped_cert_numbers,
+        )
+    scrape_certifications.skipped_cert_numbers = skipped_cert_numbers  # type: ignore[attr-defined]
 
     rows = list(by_cert.values())
     rows.sort(key=lambda row: int(row["certification_number"]))
@@ -526,12 +692,23 @@ def scrape_certifications(
             fetch_pdf=fetch_pdf,
             pdf_to_text=pdf_to_text,
             delay_seconds=delay_seconds,
+            sleep=sleep,
         )
     return rows
 
 def scrape_to_wide_csv(
-    csv_path: Any, *, delay_seconds: float = 0.25, read_documents: bool = True
+    csv_path: Any,
+    *,
+    delay_seconds: float = 0.25,
+    read_documents: bool = True,
+    grid_timeout_seconds: int = GRID_TIMEOUT_SECONDS,
+    grid_attempts: int = GRID_ATTEMPTS,
 ) -> int:
-    rows = scrape_certifications(delay_seconds=delay_seconds, read_documents=read_documents)
+    rows = scrape_certifications(
+        delay_seconds=delay_seconds,
+        read_documents=read_documents,
+        grid_timeout_seconds=grid_timeout_seconds,
+        grid_attempts=grid_attempts,
+    )
     return write_wide_csv(rows, csv_path, fieldnames=WIDE_FIELDNAMES)
 
