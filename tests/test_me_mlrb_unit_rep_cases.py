@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from perb_data_collection.collectors.me_mlrb_unit_rep_cases import (
+    _parties_from_body,
     parse_case_page,
     scrape_unit_rep_cases,
 )
@@ -76,3 +77,63 @@ def test_scrape_uses_fixtures() -> None:
     by_case = {row["case_number"]: row for row in rows}
     assert by_case["12-UC-03"]["employer_name"] == "PENOBSCOT COUNTY SHERIFF'S DEPARTMENT"
     assert by_case["02-UC-01"]["employer_name"] == "Town of Topsham"
+
+
+def test_parse_paren_column_caption() -> None:
+    """The `)` column caption block still yields labeled roles."""
+    html = (FIXTURES / "me_mlrb_93_uc_01.html").read_text()
+    row = parse_case_page(
+        filename="93-UC-01.htm",
+        html=html,
+        case_url="https://www.maine.gov/mlrb/decisions/rep/93-UC-01.htm",
+        scraped_at="2026-09-10T00:00:00+00:00",
+    )
+    assert row["employer_name"] == "ORONO SCHOOL COMMITTEE"
+    assert row["union_name"] == "ORONO TEACHERS ASSOCIATION/MTA/NEA"
+    assert row["decision_date"] == "December 7, 1992"
+
+
+def test_parse_decert_bargaining_agent_caption() -> None:
+    """Individual petitioner: the union comes from the bargaining-agent label."""
+    html = (FIXTURES / "me_mlrb_03_ud_02.html").read_text()
+    row = parse_case_page(
+        filename="03-UD-02.htm",
+        html=html,
+        case_url="https://www.maine.gov/mlrb/decisions/rep/03-UD-02.htm",
+        scraped_at="2026-09-10T00:00:00+00:00",
+    )
+    assert row["employer_name"] == "CITY OF WATERVILLE"
+    assert row["union_name"] == "TEAMSTERS UNION LOCAL NO. 340"
+    assert row["decision_date"] == "October 28, 2002"
+    assert "RYAN ADAMS" not in row["union_name"]
+
+
+def test_parties_from_synthetic_paren_caption() -> None:
+    text = (
+        "Case No. 93-UC-01\n"
+        "Issued: December 7, 1992\n"
+        "_________________________________________ \n"
+        ")\n"
+        "ORONO TEACHERS ASSOCIATION/MTA/NEA )\n"
+        ")\n"
+        "Petitioner, )\n"
+        ")\n"
+        "and ) UNIT CLARIFICATION\n"
+        ") REPORT\n"
+        "ORONO SCHOOL COMMITTEE, )\n"
+        ")\n"
+        "Public Employer )\n"
+        "_________________________________________) \n"
+    )
+    employer, union, date = _parties_from_body(f"<html><body><pre>{text}</pre></body></html>")
+    assert employer == "ORONO SCHOOL COMMITTEE"
+    assert union == "ORONO TEACHERS ASSOCIATION/MTA/NEA"
+    assert date == "December 7, 1992"
+
+
+def test_no_role_labels_returns_empty_parties() -> None:
+    text = "Issued: May 1, 2001\nTown of Anywhere and Some Union Local 1\n"
+    employer, union, date = _parties_from_body(f"<html><body><pre>{text}</pre></body></html>")
+    assert employer == ""
+    assert union == ""
+    assert date == "May 1, 2001"

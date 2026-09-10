@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from perb_data_collection.collectors.il_ilrb_bargaining_certs import (
     _heal_shredded_fields,
     _jurisdiction_city,
     _strip_neighbor_bleed,
+    find_table_sections,
     parse_certs_text,
 )
 
@@ -112,3 +114,82 @@ def test_fy14_shred_snippet_recovers_date_and_iuoe() -> None:
     assert row["certified_date"] == "8/29/2013"
     assert "Operating Engineers" in row["union_name"]
     assert "8/" not in row["union_name"] or "8/29" in row["certified_date"]
+
+
+def test_fy14_sections_map_columns_per_table() -> None:
+    """Each table in a volume gets its own header, so S-DE keeps no union."""
+    text = (FIXTURES / "il_ilrb_fy14_sections_snippet.txt").read_text()
+    sections = find_table_sections(text.split("\n"))
+    headings = [heading for heading, _line, _cols in sections]
+    assert "CERTIFICATIONS OF REPRESENTATIVE" in headings
+    assert "AMENDMENT TO CERTIFICATIONS" in headings
+    assert "REVOCATION OF CERTIFICATIONS" in headings
+    designation = next(h for h in headings if "GUBERNATORIAL" in h)
+    de_columns = next(
+        cols for heading, _line, cols in sections if heading == designation
+    )
+    assert [role for role, _start in de_columns] == [
+        "case",
+        "employer",
+        "certified",
+        "agency",
+        "employees",
+        "unit",
+    ]
+
+    rows = parse_certs_text(
+        text,
+        fiscal_year="FY14",
+        pdf_url="https://example.test/fy14.pdf",
+        scraped_at="2026-09-10T00:00:00+00:00",
+    )
+    by_case = {row["case_number"]: row for row in rows}
+
+    # The S-DE designation table has no Labor Organization column at all, and
+    # its State Agency column used to be read as the union name.
+    designated = by_case["S-DE-14-054"]
+    assert designated["union_name"] == ""
+    assert designated["agency"] == "Department of Corrections"
+    assert designated["employer_name"] == "State of Illinois, DCMS"
+    assert designated["certified_date"] == "09/19/2013"
+    assert designated["employees"] == "1"
+    assert designated["bargaining_unit_name"] == "Medical Administrator 4"
+    assert "GUBERNATORIAL" in designated["table_heading"]
+
+    # A blank line separates two independent designations; it is not a merge.
+    assert "S-DE-14-055" in by_case
+
+    # A representation row in the same file still carries its union.
+    represented = by_case["S-RC-13-058"]
+    assert represented["union_name"] == "Illinois FOP Labor Council"
+    assert represented["agency"] == ""
+    assert represented["table_heading"] == "CERTIFICATIONS OF REPRESENTATIVE"
+
+    # The revocation table's employer names used to arrive scrambled.
+    revoked = by_case["S-DD-14-002"]
+    assert revoked["employer_name"] == "County of Jasper and Sheriff of Jasper County"
+    assert revoked["union_name"] == "Laborers' Int'l Union of North America, Local 1280"
+    assert revoked["table_heading"] == "REVOCATION OF CERTIFICATIONS"
+    assert revoked["canonical_case_type"] == "DECERTIFICATION"
+
+
+def test_no_fixture_row_has_a_date_shaped_union() -> None:
+    fixtures = {
+        "FY14": "il_ilrb_fy14_shred_snippet.txt",
+        "FY14S": "il_ilrb_fy14_sections_snippet.txt",
+        "FY27": "il_ilrb_fy27_snippet.txt",
+    }
+    for fiscal_year, name in fixtures.items():
+        rows = parse_certs_text(
+            (FIXTURES / name).read_text(),
+            fiscal_year=fiscal_year,
+            pdf_url="https://example.test/x.pdf",
+            scraped_at="2026-09-10T00:00:00+00:00",
+        )
+        assert rows, name
+        for row in rows:
+            assert not re.search(r"\d{1,2}/\d", row["union_name"] or ""), (
+                name,
+                row["case_number"],
+                row["union_name"],
+            )

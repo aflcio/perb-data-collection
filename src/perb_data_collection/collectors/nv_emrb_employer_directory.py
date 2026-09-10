@@ -71,6 +71,65 @@ _SKIP_LINE_RE = re.compile(
     r"First Name\s+Last Name|GOVERNMENT\s+First Name",
     flags=re.I,
 )
+# Bare affiliation fragments — the tail of "AFL-CIO" that wrapped onto its own
+# line, with no organisational body attached.
+_BARE_AFFILIATION_RE = re.compile(r"^(AFL-CIO|AFL CIO|AFL|-?CIO)$", flags=re.I)
+# Organisational tokens that mark a genuine union/association name even when
+# it is a single short capitalised word (e.g. "Guild").
+_ORG_TOKEN_RE = re.compile(
+    r"\b(Local|Union|Assn|Association|Chapter|Lodge|Guild|Employees|Officers|"
+    r"Firefighters|Teamsters|SEIU|AFSCME|IUOE|Council|Federation|Alliance|"
+    r"Coalition)\b",
+    flags=re.I,
+)
+
+
+def _looks_like_contact_name(union: str, contact_name: str) -> bool:
+    """True when the union column actually holds the contact's name (column slide)."""
+    union = union.strip()
+    contact_name = contact_name.strip()
+    if not union or not contact_name:
+        return False
+    if union.lower() == contact_name.lower():
+        return True
+    tokens = contact_name.split()
+    if tokens and union.lower() in {tokens[0].lower(), tokens[-1].lower()}:
+        return True
+    return contact_name.lower().startswith(union.lower())
+
+
+def _looks_like_bare_affiliation_fragment(union: str) -> bool:
+    """True for bare "CIO"/"AFL"/"AFL-CIO" wraps or short non-org single words."""
+    union = union.strip()
+    if not union:
+        return False
+    if _BARE_AFFILIATION_RE.match(union):
+        return True
+    if (
+        re.fullmatch(r"[A-Z][a-z]{0,5}", union)
+        and not _ORG_TOKEN_RE.search(union)
+    ):
+        return True
+    return False
+
+
+def _scrub_union_name(union: str, contact_name: str) -> str:
+    """Empty a union value the parser mistook from an adjacent column.
+
+    Applied at the point the union value is finalised for a row: (a) the
+    contact's name slid into the union column, or (b) only a bare
+    affiliation fragment ("CIO", "AFL-CIO", …) survived because the tail of
+    "AFL-CIO" wrapped onto its own PDF line. Do not try to repair or
+    reorder the value — just drop it so downstream curation sees an empty
+    union rather than a contact name or a fragment.
+    """
+    if not union:
+        return union
+    if _looks_like_contact_name(union, contact_name):
+        return ""
+    if _looks_like_bare_affiliation_fragment(union):
+        return ""
+    return union
 
 def _absolute_url(href: str) -> str:
     """Join to BASE_URL and percent-encode spaces in the path (http.client forbids them)."""
@@ -227,6 +286,7 @@ def _parse_primary_line(line: str) -> dict[str, str] | None:
 
     phone, email, union, unit, website = _parse_tail(right)
     contact = _clean(f"{first} {last}")
+    union = _scrub_union_name(union, contact)
     return {
         "employer_name": _clean(employer),
         "contact_name": contact,
@@ -308,6 +368,9 @@ def parse_employer_text(
         if not cont:
             continue
         union, unit = cont
+        union = _scrub_union_name(union, current.get("contact_name", ""))
+        if not union and not unit:
+            continue
         piece = {
             **current,
             "union_name": union,

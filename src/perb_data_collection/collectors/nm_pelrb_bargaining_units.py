@@ -119,6 +119,20 @@ _UNIONISH_RE = re.compile(
     r"Council\s+\d+)\b",
     flags=re.I,
 )
+# Organisational token that marks a candidate as an actual bargaining agent
+# rather than a unit-description masquerading as one.
+_ORG_TOKEN_RE = re.compile(
+    r"\b(Local|Union|Assn|Ass'?n|Association|AFSCME|CWA|NEA|AFT|SEIU|IAFF|FOP|"
+    r"Teamsters|Federation|Council|Chapter|Alliance|Guild|Brotherhood|"
+    r"Employees\s+Association)\b",
+    flags=re.I,
+)
+# Plural job-classification nouns that show up in a list of job titles, not a
+# union name.
+_JOB_CLASS_RE = re.compile(
+    r"\b(Operators?|Drivers?|Clerks?|Technicians?|Laborers?|Mechanics?)\b",
+    flags=re.I,
+)
 _PAGE_FOOTER_RE = re.compile(r"^\s*\d+\s*\|\s*P\s*a\s*g\s*e\s*$", flags=re.I)
 
 _SECTION_SLUGS = {
@@ -232,6 +246,26 @@ def _unit_without_union(body: str) -> bool:
     # Typical no-union form: "Anthony Police Dept (Full-time …)"
     return bool(re.match(r"^[A-Z].+\([^)]+\)\s*$", body.strip()))
 
+
+def _looks_like_invented_union(candidate: str) -> bool:
+    """True when a split-out "union" is actually a unit description.
+
+    Two shapes are known to slip through `_split_union_and_unit`: three or
+    more comma-separated segments with no organisational token (a list of
+    job classifications strung together, e.g. Estancia Valley Solid Waste
+    Authority's roster entry), or a candidate dominated by plural
+    job-classification nouns (Operators, Drivers, Clerks, Technicians,
+    Laborers, Mechanics) with no organisational token at all. A real union
+    name carries an org token (Local, Union, AFSCME, Council, …) and is not
+    reclassified even when it also happens to contain commas.
+    """
+    if _ORG_TOKEN_RE.search(candidate):
+        return False
+    segments = [segment.strip() for segment in candidate.split(",") if segment.strip()]
+    if len(segments) >= 3:
+        return True
+    return bool(_JOB_CLASS_RE.search(candidate))
+
 def _slug_employer(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", name.strip().upper()).strip("_")
     return slug[:80] or "UNKNOWN"
@@ -313,6 +347,14 @@ def parse_units_text(
             if not unit_name and union_name == body:
                 # Entire body is the union with no separate unit parenthetical.
                 unit_name = ""
+            if union_name and _looks_like_invented_union(union_name):
+                # Not a union — a unit description that slipped past the
+                # split (job-classification list, no org token). Preserve
+                # the text as the bargaining unit rather than inventing a
+                # union from it.
+                if not unit_name:
+                    unit_name = body
+                union_name = ""
 
         row_key = (
             f"{AGENCY_CODE}:{section_slug}:"

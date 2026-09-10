@@ -39,6 +39,12 @@ def test_parse_units_text_fixture() -> None:
     assert abq["jurisdiction_city"] == "Albuquerque"
     assert abq["approx_employees"] == "1200"
 
+    estancia = by_key["NM_PELRB:pelrb_local:ESTANCIA_VALLEY_SOLID_WASTE_AUTHORITY:a"]
+    assert estancia["union_name"] == ""
+    assert estancia["bargaining_unit_name"].startswith("Truck Drivers")
+    assert "Landfill Operators" in estancia["bargaining_unit_name"]
+    assert estancia["approx_employees"] == "8"
+
     deaf = next(
         row
         for row in rows

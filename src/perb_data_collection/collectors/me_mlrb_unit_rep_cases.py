@@ -64,14 +64,30 @@ _ISSUED_RE = re.compile(
     r"September|October|November|December)\s+\d{1,2},\s+\d{4})",
     flags=re.I,
 )
-_PUBLIC_EMPLOYER_RE = re.compile(
-    r"(?P<name>[A-Z0-9][^,\n]{2,120}?),\s*(?:\n\s*)?"
-    r"(?:Petitioner\s+and\s+)?Public\s+Employer\.?",
-    flags=re.I | re.S,
+# Caption role labels, as printed in the party block. Roles are read from these
+# labels only -- never from caption order ("A and B").
+_ROLE_LABEL_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("both", re.compile(r"petitioners?\s+and\s+public\s+employer", flags=re.I)),
+    ("employer", re.compile(r"(?:public\s+)?employer", flags=re.I)),
+    (
+        "union",
+        re.compile(
+            r"(?:certified\s+|incumbent\s+)?bargaining\s+agent"
+            r"(?:\s*/\s*intervenor)?",
+            flags=re.I,
+        ),
+    ),
+    ("petitioner", re.compile(r"petitioners?", flags=re.I)),
 )
-_PETITIONER_RE = re.compile(
-    r"(?P<name>[A-Z0-9][^,\n]{2,120}?),\s*(?:\n\s*)?Petitioner(?:\s+and\s+Public\s+Employer)?\.?",
-    flags=re.I | re.S,
+# A horizontal rule drawn with underscores/dashes delimits the caption block.
+_RULE_LINE_RE = re.compile(r"^(?=[^_\-]*[_\-]{5})[_\-\u2014)\s]+$")
+_CASE_NO_LINE_RE = re.compile(
+    r"^(?:STATE\s+OF\s+MAINE|MAINE\s+LABOR\s+RELATIONS\s+BOARD"
+    r"|Case\s+No\.|Issued:|and|v\.)\b",
+    flags=re.I,
+)
+_CASE_NO_TAIL_RE = re.compile(
+    r",?\s*(?:Case\s+)?No\.\s*\d{2}-[A-Z]+(?:-\d+[A-Z]?)?\.?\s*$", flags=re.I
 )
 _TRAILING_CASE_RE = re.compile(
     r",?\s*(?:No\.\s*)?(?:\d{2}-[A-Z]+(?:-\d+[A-Z]?)?|\d+\s*A\.?\s*2d\s*\d+)\.?\s*$",
@@ -145,8 +161,91 @@ def _clean_party_name(name: str) -> str:
     cleaned = strip_html_text(name)
     cleaned = cleaned.replace("\xa0", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(",.")
+    cleaned = _CASE_NO_TAIL_RE.sub("", cleaned).strip().rstrip(",")
     cleaned = _TRAILING_CASE_RE.sub("", cleaned).strip().rstrip(",")
     return cleaned
+
+
+def _strip_caption_column(line: str) -> str:
+    """Drop the ``)`` caption column and anything printed to the right of it.
+
+    Captions are laid out as two columns separated by a run of ``)``
+    characters, so ``"Certified Bargaining Agent, ) REPORT"`` carries the role
+    label on the left and the document title on the right. Parentheses that are
+    part of the name itself (``"... (MSEA)"``) are kept by tracking depth.
+    """
+    depth = 0
+    for index, char in enumerate(line):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                return line[:index].strip()
+            depth -= 1
+    return line.strip()
+
+
+def _caption_lines(text: str) -> list[str]:
+    """Return the cleaned lines of the caption block, in printed order."""
+    anchor = _ISSUED_RE.search(text)
+    start = anchor.end() if anchor else 0
+    raw = text[start:].splitlines()
+
+    lines: list[str] = []
+    seen_rule = False
+    for raw_line in raw[:80]:
+        stripped = raw_line.strip()
+        if _RULE_LINE_RE.match(stripped):
+            if seen_rule and lines:
+                break
+            seen_rule = True
+            continue
+        line = _strip_caption_column(stripped)
+        if not line:
+            continue
+        if not re.search(r"[A-Za-z0-9]", line):
+            continue
+        if len(line) > 100:
+            # A body paragraph: the caption block is over.
+            break
+        lines.append(line)
+        if len(lines) >= 40:
+            break
+    return lines
+
+
+def _role_of(line: str) -> str:
+    label = line.strip().strip(",.;:").strip()
+    for role, pattern in _ROLE_LABEL_RES:
+        if pattern.fullmatch(label):
+            return role
+    return ""
+
+
+def _name_above(lines: list[str], index: int) -> str:
+    """The last printed name line above a role label."""
+    for candidate in reversed(lines[:index]):
+        if _role_of(candidate):
+            continue
+        if _CASE_NO_LINE_RE.match(candidate.strip()):
+            continue
+        name = _clean_party_name(candidate)
+        if name:
+            return name
+    return ""
+
+
+def _name_below(lines: list[str], index: int) -> str:
+    """The next printed name line below a role label."""
+    for candidate in lines[index + 1 :]:
+        if _role_of(candidate):
+            continue
+        if _CASE_NO_LINE_RE.match(candidate.strip()):
+            continue
+        name = _clean_party_name(candidate)
+        if name:
+            return name
+    return ""
 
 
 def _parties_from_body(html: str) -> tuple[str, str, str]:
@@ -158,36 +257,49 @@ def _parties_from_body(html: str) -> tuple[str, str, str]:
     if issued:
         decision_date = issued.group("date")
 
+    lines = _caption_lines(text)
+
     employer = ""
     union = ""
-    emp_match = _PUBLIC_EMPLOYER_RE.search(text)
-    if emp_match:
-        employer = _clean_party_name(emp_match.group("name"))
-        # "Petitioner and Public Employer" means the same party is both.
-        if re.search(r"Petitioner\s+and\s+Public\s+Employer", emp_match.group(0), re.I):
-            # Find the other party after "and" in the caption block.
-            after = text[emp_match.end() : emp_match.end() + 400]
-            other = re.search(
-                r"\band\b\s*(?P<name>[A-Z0-9][^,\n]{2,120}?)(?:,|\n|$)",
-                after,
-                flags=re.I,
-            )
-            if other:
-                union = _clean_party_name(other.group("name"))
-            return employer, union, decision_date
+    petitioners: list[str] = []
+    both_index = -1
+    for index, line in enumerate(lines):
+        role = _role_of(line)
+        if not role:
+            continue
+        name = _name_above(lines, index)
+        if not name:
+            continue
+        if role == "both":
+            if not employer:
+                employer = name
+            both_index = index
+        elif role == "employer":
+            if not employer:
+                employer = name
+        elif role == "union":
+            if not union:
+                union = name
+        elif role == "petitioner":
+            if name not in petitioners:
+                petitioners.append(name)
 
-    pet_match = _PETITIONER_RE.search(text)
-    if pet_match:
-        petitioner = _clean_party_name(pet_match.group("name"))
-        if employer and petitioner and petitioner.lower() != employer.lower():
-            union = petitioner
-        elif not employer:
-            # Petitioner-only without Public Employer label — leave roles unset
-            # rather than guessing caption order.
-            pass
-    if employer:
-        return employer, union, decision_date
-    return "", "", decision_date
+    if not employer:
+        # No employer label: do not guess a role from caption order.
+        return "", "", decision_date
+
+    if not union and both_index >= 0:
+        # "Petitioner and Public Employer" -- the counterparty is the next name
+        # printed in the caption.
+        candidate = _name_below(lines, both_index)
+        if candidate and candidate.lower() != employer.lower():
+            union = candidate
+
+    if not union:
+        others = [p for p in petitioners if p.lower() != employer.lower()]
+        union = "; ".join(others)
+
+    return employer, union, decision_date
 
 
 def _parties_from_title(title: str) -> tuple[str, str, str]:

@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 from perb_data_collection.http import fetch_url
 from perb_data_collection.csv_io import write_wide_csv
+from perb_data_collection.party_roles import assign_roles
 
 FLOW_NAME = "OR ERB ContentDM Orders Flow"
 REPORT_PREFIX = "or_erb_contentdm_orders"
@@ -85,43 +86,28 @@ def _canonical(native_type: str, title: str) -> str:
             return canonical
     return "ULP"
 
-def _parties(official_case_name: str) -> tuple[str, str]:
-    """Split 'A v. B' style Case Name into (employer, union) heuristically."""
+def _parties(official_case_name: str, native_type: str = "") -> tuple[str, str]:
+    """Return (employer, union) from the ContentDM Official Case Name.
+
+    Roles are decided by the token vocabulary in ``party_roles``, never by
+    which side of " v. " a party sits on: ERB captions are charging party v.
+    respondent on unfair labour practice cases (so the union is usually left)
+    and petitioner v. respondent on representation / unit clarification cases
+    (so the employer is often left).  ``native_type`` is carried for that
+    context, but it is never allowed to assign a role the tokens do not
+    prove — a swapped caption and a mislabelled type would otherwise compound.
+    An individual charging party lands in neither column.
+    """
     text = re.sub(r"\s+", " ", official_case_name).strip()
     if not text:
         return "", ""
     match = re.search(r"\s+v\.?\s+", text, flags=re.I)
     if not match:
-        return text, ""
-    left = text[: match.start()].strip(" ,;")
-    right = text[match.end() :].strip(" ,;")
-    employer_hints = (
-        "city",
-        "county",
-        "district",
-        "state",
-        "school",
-        "university",
-        "college",
-        "town",
-        "borough",
-        "metro",
-        "hospital",
-        "commission",
-        "authority",
-        "bureau",
-        "department",
-        "fire and rescue",
-    )
-    left_emp = any(h in left.lower() for h in employer_hints)
-    right_emp = any(h in right.lower() for h in employer_hints)
-    if right_emp and not left_emp:
-        return right, left
-    if left_emp and not right_emp:
-        return left, right
-    # Default: first party petitioner/charging party; prefer right as employer
-    # when neither side looks public (individual vs local).
-    return right if right_emp or not left_emp else left, left if right_emp or not left_emp else right
+        # A one-party case name proves no role at all.
+        return "", ""
+    left = text[: match.start()]
+    right = text[match.end() :]
+    return assign_roles(left, right)
 
 def _jurisdiction_city(employer_name: str) -> str:
     name = employer_name.strip()
@@ -149,7 +135,7 @@ def parse_query_page(payload: dict[str, Any], *, scraped_at: str) -> list[dict[s
         native = str(rec.get("type") or "").strip() or "ORDER"
         decision_date = str(rec.get("date") or "").strip()
         case_number = _case_number(title, official)
-        employer, union = _parties(official)
+        employer, union = _parties(official, native)
         pdf_url = _pdf_url(pointer)
         item_url = _item_page_url(pointer)
         row_key = f"{AGENCY_CODE}:{pointer}:{case_number}"
