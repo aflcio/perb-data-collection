@@ -17,6 +17,7 @@ from urllib.parse import unquote, urljoin
 
 from perb_data_collection.http import fetch_url, strip_html_text
 from perb_data_collection.csv_io import write_wide_csv
+from perb_data_collection.party_roles import assign_roles
 
 FLOW_NAME = "PA PLRB Final Orders Flow"
 REPORT_PREFIX = "pa_plrb_final_orders"
@@ -102,12 +103,18 @@ def _canonical(title: str, case_number: str) -> str:
     return "ULP"
 
 def _parties_from_title(title: str) -> tuple[str, str]:
+    """Return (employer_name, union_name) decided by content, never by position.
+
+    PLRB final orders are captioned complainant v. respondent, so the union is
+    on the left only on union-filed charges.  Employer-filed charges put the
+    township on the left, and duty-of-fair-representation charges put an
+    individual there.  Anything the tokens do not prove stays empty.
+    """
     parts = _V_SPLIT_RE.split(title, maxsplit=1)
     if len(parts) != 2:
         return "", ""
-    left, right = parts[0].strip(), parts[1].strip()
-    # Typical: Union v. Employer
-    return right[:160], left[:160]
+    employer, union = assign_roles(parts[0], parts[1])
+    return employer[:160], union[:160]
 
 def _jurisdiction_city(employer_name: str) -> str:
     name = employer_name.strip()
@@ -162,7 +169,7 @@ def parse_year_page(
                 "canonical_case_type": _canonical(title, case_number),
                 "native_case_type": native,
                 "decision_year": decision_year,
-                "employer_name": employer or title[:120],
+                "employer_name": employer,
                 "union_name": union,
                 "document_title": title,
                 "pdf_url": pdf_url,
