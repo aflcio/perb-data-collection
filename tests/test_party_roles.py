@@ -271,3 +271,82 @@ def test_unclassifiable_side_still_releases_the_union() -> None:
 def test_one_party_captions_stay_empty() -> None:
     assert assign_roles("In the Matter of the Petition of Lane County", "") == ("", "")
     assert assign_roles("", "In the Matter of AFSCME Local 88") == ("", "")
+
+
+# --- a side that is itself a union is never split --------------------------
+
+
+def test_a_union_with_and_in_its_own_name_is_not_split() -> None:
+    employer, union = assign_roles(
+        "State College and University Professional Association, PSEA/NEA",
+        "Pennsylvania State System of Higher Education",
+    )
+    assert union == "State College and University Professional Association, PSEA/NEA"
+    assert employer != "State College and University Professional Association, PSEA/NEA"
+    assert "State College" not in employer
+
+    employer, union = assign_roles(
+        "Association of Pennsylvania State College and University Faculties",
+        "Pennsylvania State System of Higher Education",
+    )
+    assert union == "Association of Pennsylvania State College and University Faculties"
+    assert "University Faculties" not in employer
+    assert has_union_head(
+        "Association of Pennsylvania State College and University Faculties"
+    )
+
+
+def test_legitimate_compounds_still_split_alongside_the_union_guard() -> None:
+    assert assign_roles("Multnomah County and AFSCME Local 88", "Jepson") == (
+        "Multnomah County",
+        "AFSCME Local 88",
+    )
+    assert assign_roles(
+        "City of Medford and Teamsters Local 223",
+        "In the Matter of a Petition",
+    ) == ("City of Medford", "Teamsters Local 223")
+    assert assign_roles(
+        "Salem Education Association and Salem School District 24J", "X"
+    ) == ("Salem School District 24J", "Salem Education Association")
+    assert assign_roles(
+        "Bay Area Hospital and Oregon Licensed Practical Nurses Association", "X"
+    ) == ("Bay Area Hospital", "Oregon Licensed Practical Nurses Association")
+    employer, union = assign_roles(
+        "Portland Firefighters' Association, Local 43 and City of Portland "
+        "Fire and Rescue Bureau",
+        "X",
+    )
+    assert employer == "City of Portland Fire and Rescue Bureau"
+    assert union == "Portland Firefighters' Association, Local 43"
+
+
+# --- "Union" as a place adjective, not the organisation noun ---------------
+
+
+def test_union_as_place_adjective_is_not_a_union_token() -> None:
+    for name in (
+        "Union High School District 5",
+        "Union County",
+        "Union School District",
+        "Union Township",
+        "Union City",
+    ):
+        assert not is_union(name), name
+        assert is_public_employer(name), name
+
+    for name in (
+        "Teamsters Union",
+        "Oregon Public Employees Union",
+        "Union of Operating Engineers",
+        "Union Local 371",
+    ):
+        assert is_union(name), name
+
+
+def test_union_prefixed_public_body_in_a_compound_caption() -> None:
+    employer, union = assign_roles(
+        "Union High School District 5 and Clackamas County",
+        "Oregon School Employees Association",
+    )
+    assert "Union High School District 5" not in union
+    assert union == "Oregon School Employees Association"
