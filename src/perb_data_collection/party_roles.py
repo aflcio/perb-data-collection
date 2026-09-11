@@ -43,7 +43,14 @@ import re
 # only mean "union" when no strong public-employer token is present.
 
 _STRONG_UNION_TOKENS: tuple[str, ...] = (
-    r"unions?\b",
+    # "Union" is a place adjective, not the organisation noun, when it leads a
+    # public-body phrase: "Union High School District 5", "Union County",
+    # "Union School District", "Union Township", "Union City". It counts as
+    # a union token everywhere else — as the head noun ("Teamsters Union"),
+    # or followed by "Local"/"No."/a number/"of" ("Union of Operating
+    # Engineers", "Union Local 371", "Union No. 5").
+    r"union(?!\s+(?:high\s+school|free\s+school\s+district|school\s+district|"
+    r"county|township|city))s?\b",
     r"local(?:s)?\b",
     r"lodge",
     r"federation",
@@ -170,7 +177,7 @@ _UNION_HEAD_TAIL_RE = re.compile(
     r"union|unions|lodge|chapter|federation|guild|"
     r"brotherhood|sisterhood|"
     r"employees|employes|officers|patrolmen|firefighters|"
-    r"professors|academics|faculty|"
+    r"professors|academics|faculty|faculties|"
     r"local|"
     r"nea|oea|osea|aaup|afscme|seiu|aft|iaff|fop|ppcoa|afl[-\s]?cio"
     r")[’']?s?\.?$",
@@ -252,6 +259,32 @@ def has_union_head(text: str) -> bool:
         if _UNION_HEAD_TAIL_RE.search(tail):
             return True
     # A trailing parenthetical or slash/hyphen acronym: (PSU-AAUP), /OEA.
+    match = _TRAILING_PAREN_RE.search(side)
+    if match and _UNION_ACRONYM_RE.search(match.group(1)):
+        return True
+    trailer = re.search(r"[-/]\s*([A-Za-z][A-Za-z\-/]*)\s*$", side)
+    if trailer and _UNION_ACRONYM_RE.search(trailer.group(1)):
+        return True
+    return False
+
+
+def _whole_side_is_one_union(side: str) -> bool:
+    """True when the *whole* side's own head noun names a union, so a side
+    containing ' and ' must never be torn into two parties.
+
+    This is deliberately narrower than :func:`has_union_head`: it skips the
+    tail-word list (``... Association`` at the very end also matches a
+    legitimate two-party compound like ``Bay Area Hospital and Oregon
+    Licensed Practical Nurses Association``) and the numbered-unit check
+    (``... and AFSCME Local 88`` also ends in a numbered unit, but is a
+    legitimate compound too). What is left — a leading "Association of …"
+    / "Union of …" phrase, or a trailing union acronym in parentheses or
+    after a hyphen/slash — only ever names one organisation, "and" included:
+    ``Association of Pennsylvania State College and University Faculties``,
+    ``State College and University Professional Association, PSEA/NEA``.
+    """
+    if _UNION_OF_RE.search(side):
+        return True
     match = _TRAILING_PAREN_RE.search(side)
     if match and _UNION_ACRONYM_RE.search(match.group(1)):
         return True
@@ -365,6 +398,11 @@ def split_side(text: str) -> tuple[list[str], list[str]]:
     side = normalize_side(text)
     if not side:
         return [], []
+
+    if _whole_side_is_one_union(side):
+        # The side's own head noun already names one union; never split it,
+        # even though a fragment before " and " would classify on its own.
+        return [], [side]
 
     atoms = [a.strip() for a in _ATOM_SPLIT_RE.split(side) if a.strip()]
     if len(atoms) > 1:
