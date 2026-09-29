@@ -14,6 +14,7 @@ begins.  See docs/research/agencies/nmb-weekly-activity-reports.md.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections import Counter
@@ -644,6 +645,12 @@ def discover_report_urls(index_html: str, *, index_url: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# Downstream keys (CLRR source_record_id) are 128 characters. Leave room for a
+# ":NN" repeat ordinal.
+MAX_ROW_KEY_LENGTH = 128
+_ROW_KEY_BASE_LIMIT = MAX_ROW_KEY_LENGTH - 4
+
+
 def _assign_row_keys(rows: list[dict[str, str]]) -> None:
     """``NMB-WAR:{week_end}:{section}:{case}:{org}:{craft}`` plus an ordinal on repeats.
 
@@ -661,6 +668,11 @@ def _assign_row_keys(rows: list[dict[str, str]]) -> None:
             _key_part(row["union_name"]) or "NO-ORG",
             _key_part(row["craft_class"]) or "NO-CRAFT",
         ))
+        if len(base) > _ROW_KEY_BASE_LIMIT:
+            # A long list of crafts ("AIRCRAFT-MECHANICS-RELATED-REFUELERS-...") would
+            # overrun the 128-character source_record_id CLRR curation keys on.
+            digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
+            base = f"{base[:_ROW_KEY_BASE_LIMIT - 12]}:H{digest}"
         counts[base] += 1
         row["row_key"] = base if counts[base] == 1 else f"{base}:{counts[base]}"
 
