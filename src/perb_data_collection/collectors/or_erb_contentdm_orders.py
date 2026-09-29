@@ -19,7 +19,12 @@ from urllib.parse import quote
 
 from perb_data_collection.http import fetch_url
 from perb_data_collection.csv_io import write_wide_csv
-from perb_data_collection.party_roles import assign_roles
+from perb_data_collection.party_roles import (
+    assign_roles,
+    distinct_parties,
+    normalize_side,
+    split_side,
+)
 
 FLOW_NAME = "OR ERB ContentDM Orders Flow"
 REPORT_PREFIX = "or_erb_contentdm_orders"
@@ -86,6 +91,58 @@ def _canonical(native_type: str, title: str) -> str:
             return canonical
     return "ULP"
 
+# " v. " with the spacing the index actually uses: "(PCCFF)v. Portland",
+# "AFSCME Local 3512 v.Willamalane", "Salem Education Association v, Salem",
+# "Baltus et al V. Multnomah". The no-space forms need the dot and a capital
+# after it, so "Kovach" and "Davis" never split.
+_V_SEPARATOR_RE = re.compile(
+    r"\s+[vV][.,]?\s+|(?<=\))[vV]\.?\s*(?=[A-Z])|\s+[vV]\.(?=[A-Z])",
+)
+_JOINT_FILING_RE = re.compile(r"\bjointly\s+filed\s+by\s+(.+)$", flags=re.I)
+_CAPTION_JOIN_RE = re.compile(r"\s+(?:and|&)\s+|\s+/\s+", flags=re.I)
+
+
+def _key(party: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", party.lower())
+
+
+def _caption_parties(text: str) -> list[str]:
+    """Split a case name into its parties at every " v. ".
+
+    Cross-petitions are captioned twice, "Polk County v. Polk County Deputy
+    Sheriff's Association and Polk County Deputy Sheriff's Association v.
+    Polk County", so a middle segment can hold the end of one caption and the
+    start of the next. It is cut only where one half repeats a party named
+    elsewhere in the case name, because " and " also sits inside single names
+    ("State, County and Municipal Employees"). A middle segment that repeats
+    nothing is a party of its own ("Grisham-Tittle v. AFSCME Local 1246-3 v.
+    State of Oregon").
+    """
+    parts = [normalize_side(p) for p in _V_SEPARATOR_RE.split(text)]
+    parts = [p for p in parts if p]
+    if len(parts) <= 2:
+        return parts
+    out = [parts[0]]
+    for i in range(1, len(parts) - 1):
+        mid = parts[i]
+        others = {_key(p) for j, p in enumerate(parts) if j != i}
+        for m in _CAPTION_JOIN_RE.finditer(mid):
+            before, after = mid[: m.start()], mid[m.end() :]
+            if _key(before) == _key(after):
+                # "Morrow County School District and Morrow County School
+                # District": the same party closing one caption and opening
+                # the next.
+                out.append(before)
+                break
+            if _key(before) in others or _key(after) in others:
+                out.extend([before, after])
+                break
+        else:
+            out.append(mid)
+    out.append(parts[-1])
+    return out
+
+
 def _parties(official_case_name: str, native_type: str = "") -> tuple[str, str]:
     """Return (employer, union) from the ContentDM Official Case Name.
 
@@ -101,13 +158,33 @@ def _parties(official_case_name: str, native_type: str = "") -> tuple[str, str]:
     text = re.sub(r"\s+", " ", official_case_name).strip()
     if not text:
         return "", ""
-    match = re.search(r"\s+v\.?\s+", text, flags=re.I)
-    if not match:
+    parties = _caption_parties(text)
+    if len(parties) < 2:
+        joint = _JOINT_FILING_RE.search(text)
+        if joint:
+            # "Petition Jointly Filed by Corvallis School District 509J and
+            # Mid-Valley Bargaining Council": both parties on one side, and the
+            # split must prove both roles.
+            publics, unions = split_side(joint.group(1))
+            if len(publics) == 1 and len(unions) == 1:
+                return publics[0], unions[0]
         # A one-party case name proves no role at all.
         return "", ""
-    left = text[: match.start()]
-    right = text[match.end() :]
-    return assign_roles(left, right)
+    if len(parties) == 2:
+        return assign_roles(*parties)
+    publics: list[str] = []
+    unions: list[str] = []
+    for party in parties:
+        p, u = split_side(party)
+        publics += p
+        unions += u
+    publics, unions = distinct_parties(publics), distinct_parties(unions)
+    union = unions[0] if len(unions) == 1 else ""
+    # Public bodies with no union among them prove nothing, as in the
+    # two-party case. With a union named, even an ambiguous pair of them, the
+    # public bodies are the employers.
+    employer = "; ".join(publics) if unions or len(publics) == 1 else ""
+    return employer, union
 
 def _jurisdiction_city(employer_name: str) -> str:
     name = employer_name.strip()

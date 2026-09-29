@@ -49,10 +49,13 @@ _STRONG_UNION_TOKENS: tuple[str, ...] = (
     # a union token everywhere else — as the head noun ("Teamsters Union"),
     # or followed by "Local"/"No."/a number/"of" ("Union of Operating
     # Engineers", "Union Local 371", "Union No. 5").
-    r"union(?!\s+(?:high\s+school|free\s+school\s+district|school\s+district|"
-    r"county|township|city))s?\b",
+    # "City of Union" is the town, and "Klamath Union-Mazama High School" is a
+    # school named for two places, so a hyphenated place before the school
+    # noun is a place too.
+    r"(?<!city of )union(?!(?:-[a-z]+)?\s+(?:high\s+school|free\s+school\s+district|"
+    r"school\s+district|county|township|city))s?\b",
     r"local(?:s)?\b",
-    r"lodge",
+    r"lodge(?=\s+(?:no\.?\s*)?#?[a-z]?-?\d)",  # Lodge 7, Lodge W-261; not "Oak Lodge Water Services"
     r"federation",
     r"brotherhood",
     r"sisterhood",
@@ -60,6 +63,10 @@ _STRONG_UNION_TOKENS: tuple[str, ...] = (
     r"labor organization",
     r"labour organization",
     r"bargaining unit",
+    r"bargaining council",  # East County Bargaining Council: OEA's regional body
+    r"united academics",  # United Academics of Oregon State University
+    r"atu\b",  # ATU Division 757
+    r"amalgamated transit",
     r"education association",
     r"educational? support",
     r"employees'? association",
@@ -155,6 +162,8 @@ _STRONG_PUBLIC_TOKENS: tuple[str, ...] = (
     r"fire and rescue",
     r"fire district",
     r"metro\b",
+    r"tri-?met\b",
+    r"council of governments",
     r"district\b",
 )
 
@@ -174,7 +183,7 @@ _STRONG_PUBLIC_RE = _compile(_STRONG_PUBLIC_TOKENS)
 _UNION_HEAD_TAIL_RE = re.compile(
     r"\b(?:"
     r"assn|association|associations|"
-    r"union|unions|lodge|chapter|federation|guild|"
+    r"(?<!city of )unions?|lodge|chapter|federation|guild|"
     r"brotherhood|sisterhood|"
     r"employees|employes|officers|patrolmen|firefighters|"
     r"professors|academics|faculty|faculties|"
@@ -188,7 +197,7 @@ _UNION_HEAD_TAIL_RE = re.compile(
 # noun leads a prepositional phrase, so it is still the head of the name.
 _UNION_OF_RE = re.compile(
     r"\b(?:association|assn|organization|chapter|federation|council|guild|union)"
-    r"[’']?s?\s+(?:of|for)\b",
+    r"[’']?s?\s+(?:of|for)\b(?!\s+governments\b)",
     flags=re.I,
 )
 
@@ -210,9 +219,19 @@ _TRAILING_PAREN_RE = re.compile(r"\s*\(([^)]*)\)\s*$")
 _TRAILING_NOISE_RE = re.compile(r"(?:[,;]?\s*et\.?\s*al\.?)?[\s,;:.\-–—#]*$", flags=re.I)
 
 
+# A procedural label trailing a party: "… Association (LCDSA) - Intervenor".
+# The label names the party's standing in the case, not the party.
+_ROLE_LABEL_RE = re.compile(
+    r"\s*[-–—,(]\s*(?:intervenors?|respondents?|petitioners?|complainants?)\s*\)?\s*$",
+    flags=re.I,
+)
+
+
 def normalize_side(text: str) -> str:
     """Trim caption punctuation and collapse whitespace on one side."""
-    return re.sub(r"\s+", " ", (text or "")).strip(" ,;:.-–— ").strip()
+    side = re.sub(r"\s+", " ", (text or "")).strip()
+    side = _ROLE_LABEL_RE.sub("", side)
+    return side.strip(" ,;:.-–— ").strip()
 
 
 def _tails(side: str) -> list[str]:
@@ -387,6 +406,45 @@ def _classify(fragment: str) -> str:
     return ""
 
 
+# A fragment that can only be a public body: "City of Ashland", "Klamath
+# County", "State of Oregon, Department of Corrections". Deliberately narrower
+# than the public token list: "State College" (a town in Pennsylvania, and the
+# opening of a union's own name) must not qualify.
+_MUNICIPAL_LEAD_RE = re.compile(
+    r"^(?:the\s+)?(?:city|town|county|state|port|village|borough|township)\s+of\b"
+    r"|\b(?:county|school\s+district|department|sheriff[’']?s?\s+office|"
+    r"police\s+department|fire\s+district)\b",
+    flags=re.I,
+)
+
+
+def _is_municipal_lead(fragment: str) -> bool:
+    return bool(_MUNICIPAL_LEAD_RE.search(fragment)) and _classify(fragment) == "public"
+
+
+# One capitalised word reads as a surname, but these open union names:
+# "Construction and General Laborers' Union", "Plumbers and Steamfitters
+# Local 290", "Professional and Technical Employees, Local 17".
+_NOT_A_SURNAME = frozenset(
+    """
+    allied amalgamated american associated bakery brick building civil
+    classified clerical commercial construction electrical federal food
+    general hotel independent industrial international iron municipal
+    national office operating painters plumbers professional public
+    restaurant retail service sheet stationary technical trades transport
+    united
+    """.split()
+)
+
+
+def _is_cofiling_individual(atom: str) -> bool:
+    return (
+        len(atom.split()) == 1
+        and atom.lower().strip(".,") not in _NOT_A_SURNAME
+        and is_personal_name(atom)
+    )
+
+
 def split_side(text: str) -> tuple[list[str], list[str]]:
     """Return ``(public_parts, union_parts)`` for one side of a caption.
 
@@ -399,12 +457,67 @@ def split_side(text: str) -> tuple[list[str], list[str]]:
     if not side:
         return [], []
 
-    if _whole_side_is_one_union(side):
-        # The side's own head noun already names one union; never split it,
-        # even though a fragment before " and " would classify on its own.
-        return [], [side]
+    # "Fairview Training Center; AFSCME Local 1246; Department of Justice
+    # (DOJ)": a respondent list. Each entry is a party, classified on its own,
+    # and an entry that proves nothing (an individual) drops out.
+    if ";" in side:
+        publics: list[str] = []
+        unions: list[str] = []
+        for piece in side.split(";"):
+            piece = re.sub(r"^\s*and\s+", "", piece, flags=re.I)
+            its = re.match(r"\s*its\s+(.+)$", piece, flags=re.I)
+            if its:
+                # "AFSCME; and its Portland, Oregon City and Metropolitan
+                # Employees Local 189": the union's own subordinate body.
+                if is_union(its.group(1)):
+                    unions.append(normalize_side(its.group(1)))
+                continue
+            p, u = split_side(piece)
+            publics += p
+            unions += u
+        return publics, unions
 
     atoms = [a.strip() for a in _ATOM_SPLIT_RE.split(side) if a.strip()]
+
+    # "Multnomah County Deputy Sheriffs Association-Multnomah County": two
+    # parties joined by a bare hyphen. Split only when the left half ends on a
+    # union head and the right half is a municipal body, because hyphens also
+    # sit inside single names (Salem-Keizer, OEA-NEA).
+    if len(atoms) == 1:
+        hyphen = re.fullmatch(r"(.+?\S)-(\S.+)", side)
+        if hyphen:
+            left, right = hyphen.group(1), hyphen.group(2)
+            if (
+                _UNION_HEAD_TAIL_RE.search(left)
+                and not _STRONG_PUBLIC_RE.search(left.split()[-1])
+                and _is_municipal_lead(right)
+            ):
+                return [right], [left]
+
+    # "Mt. Hood Community College Faculty Association and Kotulski": an
+    # individual co-filing with the union. The individual is neither party.
+    # A bare surname only: two capitalised words ("Rescue Bureau") are as
+    # likely the tail of a name as a person.
+    if len(atoms) > 1 and _is_cofiling_individual(atoms[-1]):
+        rest = _rejoin(side, atoms, 0, len(atoms) - 1)
+        if has_union_head(rest):
+            side, atoms = rest, atoms[:-1]
+    # And leading: "Miller and Gresham Grade Teachers Association".
+    if len(atoms) > 1 and _is_cofiling_individual(atoms[0]):
+        rest = _rejoin(side, atoms, 1, len(atoms))
+        if has_union_head(rest):
+            side, atoms = rest, atoms[1:]
+
+    if _whole_side_is_one_union(side) and not (
+        len(atoms) > 1 and _is_municipal_lead(atoms[0])
+    ):
+        # The side's own head noun already names one union; never split it,
+        # even though a fragment before " and " would classify on its own.
+        # Unless the side opens on a municipal body: in "City of Ashland and
+        # IBEW, Local 659 (IBEW)" the trailing acronym is the second party's,
+        # not the whole side's.
+        return [], [side]
+
     if len(atoms) > 1:
         best = _best_segmentation(side, atoms)
         if best is not None:
@@ -467,6 +580,28 @@ def _best_segmentation(
     return best
 
 
+def distinct_parties(parties: list[str]) -> list[str]:
+    """Drop repeats, keeping the shortest form of each party.
+
+    A party named twice in one caption is one party, and the longer form is
+    usually the shorter one with individuals appended ("Monroe Elementary
+    Education Association, Sexton, Gellert").
+    """
+    def key(party: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", party.lower()).strip()
+
+    def same(longer: str, shorter: str) -> bool:
+        # At a word boundary, so "AFSCME Local 881" is not "AFSCME Local 88".
+        return longer == shorter or longer.startswith(shorter + " ")
+
+    kept: list[str] = []
+    for party in sorted(parties, key=len):
+        if not any(same(key(party), key(k)) for k in kept):
+            kept.append(party)
+    # Caption order, each kept party once.
+    return [p for i, p in enumerate(parties) if p in kept and p not in parties[:i]]
+
+
 def assign_roles(left: str, right: str) -> tuple[str, str]:
     """Return ``(employer_name, union_name)`` for one caption's two sides.
 
@@ -493,11 +628,13 @@ def assign_roles(left: str, right: str) -> tuple[str, str]:
     else:
         employer = "; ".join(a_public + b_public)
 
-    union = ""
-    if a_union and b_union and not compound:
-        union = ""  # union v. union proves nothing
-    else:
-        union = "; ".join(a_union + b_union)
+    # One union or none. A caption naming two ("Ashland Police Association v.
+    # City of Ashland and IBEW Local 659") is a unit clarification or a raid,
+    # and which union represents the unit is the outcome, stated only in the
+    # order. Picking the petitioner would file the applicant as the
+    # representative.
+    unions = distinct_parties(a_union + b_union)
+    union = unions[0] if len(unions) == 1 else ""
 
     # Never let one side occupy both columns.
     if employer and union and employer == union:

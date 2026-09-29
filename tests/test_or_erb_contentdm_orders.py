@@ -88,3 +88,58 @@ def test_parse_query_page_roles() -> None:
     both_public = by_pointer["104"]
     assert both_public["employer_name"] == ""
     assert both_public["union_name"] == ""
+
+
+def test_separator_spacing_the_index_uses() -> None:
+    assert _parties(
+        "AFSCME Local 3512 v.Willamalane Park and Recreation District"
+    ) == ("Willamalane Park and Recreation District", "AFSCME Local 3512")
+    assert _parties(
+        "Portland Community College Faculty Federation, Local 2277 AFT-Oregon, "
+        "AFL-CIO NOLC (PCCFF)v. Portland Community College (PCC)"
+    )[0] == "Portland Community College (PCC)"
+    assert _parties("Salem Education Association v, Salem-Keizer School District 24J") == (
+        "Salem-Keizer School District 24J",
+        "Salem Education Association",
+    )
+    assert _parties(
+        "Baltus et al V. Multnomah County School District 1J and Portland "
+        "Association of Teachers (PAT)"
+    ) == ("Multnomah County School District 1J", "Portland Association of Teachers (PAT)")
+    # A "v" inside a word is not a separator.
+    assert _parties("Kovach v. City of Salem") == ("City of Salem", "")
+
+
+def test_cross_petitions_captioned_twice() -> None:
+    assert _parties(
+        "Polk County v. Polk County Deputy Sheriff's Association and Polk County "
+        "Deputy Sheriff's Association v. Polk County"
+    ) == ("Polk County", "Polk County Deputy Sheriff's Association")
+    assert _parties(
+        "Morrow County Education Association v. Morrow County School District and "
+        "Morrow County School District v. Morrow County Education Association"
+    ) == ("Morrow County School District", "Morrow County Education Association")
+    assert _parties(
+        "Haskins v. State of Oregon, Oregon State Hospital (OSH) and Haskins v. "
+        "Oregon Public Employees Union (OPEU)"
+    ) == ("State of Oregon, Oregon State Hospital (OSH)", "Oregon Public Employees Union (OPEU)")
+
+
+def test_three_parties_in_one_caption() -> None:
+    # "and" inside a union's own name is not a caption boundary.
+    assert _parties(
+        "Grisham-Tittle v. American Federation of State, County and Municipal "
+        "Employees (AFSCME), Local 1246-3 v. State of Oregon, Department of "
+        "Administrative Services (DAS)"
+    ) == (
+        "State of Oregon, Department of Administrative Services (DAS)",
+        "American Federation of State, County and Municipal Employees (AFSCME), Local 1246-3",
+    )
+
+
+def test_joint_petition_needs_both_roles() -> None:
+    assert _parties(
+        "Petition Jointly Filed by Corvallis School District 509J and Mid-Valley "
+        "Bargaining Council"
+    ) == ("Corvallis School District 509J", "Mid-Valley Bargaining Council")
+    assert _parties("Petition for Declaratory Ruling Filed by City of Medford") == ("", "")
