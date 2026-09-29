@@ -11,8 +11,12 @@
 
 [`nmb-representation-determinations`](nmb-representation-determinations.md) lands the Board's
 certifications. A certification exists only where a craft or class was organised, or re-run,
-since the listing began in 1998. Units that have held a craft for decades never appear there:
-ALPA at Delta, AFA at United, APA at American, SWAPA at Southwest.
+since the listing began in 1998. Units that have held a craft without a new election since then
+never appear there. Measured against CLRR's determinations mart on 2026-09-29: APA at American and
+SWAPA at Southwest have no certification, and of the Class I railroads only one CSX coal-loading
+unit does, so BLET, SMART-TD and BMWED at Union Pacific, BNSF and CSX are absent. Airline mergers
+forced new elections, so Delta/ALPA (2009) and United/AFA and ALPA (2011) *are* in the listing;
+an earlier draft of this doc named them as missing, which was wrong.
 
 The weekly activity reports close that gap. Every week the Board lists the mediation cases it
 docketed, assigned, settled and released, as well as the representation cases it opened, balloted
