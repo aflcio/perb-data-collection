@@ -32,9 +32,10 @@ from html import unescape
 from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, unquote
 
-from perb_data_collection.http import fetch_bytes, fetch_url, strip_html_text
 from perb_data_collection.csv_io import write_wide_csv
-from perb_data_collection.pdf_probe import PdfProbe, extract_text, probe_pdf_bytes
+from perb_data_collection.dates import find_dates
+from perb_data_collection.http import fetch_document_bytes, fetch_url, strip_html_text
+from perb_data_collection.pdf_probe import PdfProbe, extract_text, ocr_pdf, probe_pdf_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,9 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "latest_order_date",
     "revocation_signal",
     "certification_order_date",
+    "certification_order_date_source",
+    "dossier_text_method",
+    "pdf_fetch_status",
     "source_page_url",
     "source_url",
     "scraped_at",
@@ -263,6 +267,10 @@ def parse_certification_table(html: str, *, scraped_at: str, source_page_url: st
                 "latest_order_date": "",
                 "revocation_signal": "",
                 "certification_order_date": "",
+                "certification_order_date_source": "",
+                "dossier_text_method": "",
+                # Empty until the dossier pass runs: "not measured".
+                "pdf_fetch_status": "",
                 # Always the CertNo= page — never the bulk Union=/Employer= result URL.
                 "source_page_url": permalink,
                 "source_url": pdf_url or permalink,
@@ -300,6 +308,10 @@ STATUS_UNKNOWN = "unknown"
 # Case-insensitive. Order matters only for which phrase is reported.
 REVOCATION_PATTERNS: tuple[tuple[str, str], ...] = (
     ("revoking_certification", r"REVOKING\s+CERTIFICATION"),
+    # "VERIFICATION OF ELECTION RESULTS AND REVOCATION OF CERTIFICATION", the
+    # order a decertification election ends in (cert 999, RD-93-016). OCR can
+    # put a stray caption character between the words.
+    ("revocation_of_certification", r"REVOCATION\s+OF\b[^.]{0,80}?\bCERTIFICATION"),
     ("hereby_revoked", r"is\s+hereby\s+REVOKED"),
     ("certification_revoked", r"certification[^.\n]{0,120}?\bis\s+revoked\b"),
     ("disclaim_granted", r"petition\s+to\s+disclaim\s+interest\s+is\s+GRANTED"),
@@ -337,23 +349,35 @@ def _clean_title(line: str) -> str:
 
 
 def _parse_dates(text: str) -> list[date]:
-    """Every ``Month D, YYYY`` or ``MM/DD/YYYY`` date in ``text``, in order."""
-    found: list[tuple[int, date]] = []
-    for match in _MONTH_DATE_RE.finditer(text):
-        month = _MONTHS[match.group(1).lower()]
-        try:
-            found.append((match.start(), date(int(match.group(3)), month, int(match.group(2)))))
-        except ValueError:
-            continue
-    for match in _NUMERIC_DATE_RE.finditer(text):
-        try:
-            found.append(
-                (match.start(), date(int(match.group(3)), int(match.group(1)), int(match.group(2))))
-            )
-        except ValueError:
-            continue
-    found.sort(key=lambda pair: pair[0])
-    return [value for _, value in found]
+    """Every day-precision date in ``text``, in order.
+
+    Shared with the other collectors: "Month D, YYYY", "MM/DD/YYYY" and the
+    ordinal forms orders are sealed with ("14th day of June, 2011", "this
+    seventeenth day of March"), bounded to a plausible year.
+    """
+    return [date.fromisoformat(hit.iso) for hit in find_dates(text)]
+
+
+# "I HEREBY CERTIFY that this document was filed and a copy served on each
+# party on June 14, 2011." -- the order's own filing date. When the clerk left
+# it blank (cert 999, 1992: "served on each party on , 1992"), the first date
+# in the order is usually the election date, and is labelled as such.
+_FILED_SERVED_RE = re.compile(
+    r"filed\s+and\s+a\s+copy\s+served\s+on\s+each\s+party\s+on\s+(?P<tail>.{0,60})",
+    re.I | re.S,
+)
+
+
+def _certification_date(body: str) -> tuple[date | None, str]:
+    filed = _FILED_SERVED_RE.search(body)
+    if filed:
+        hits = _parse_dates(filed.group("tail"))
+        if hits:
+            return hits[0], "filed_and_served"
+    hits = _parse_dates(body)
+    if hits:
+        return hits[0], "first_date_in_order"
+    return None, ""
 
 
 def find_order_sections(text: str) -> list[dict[str, Any]]:
@@ -399,6 +423,7 @@ def classify_dossier_text(text: str) -> dict[str, str]:
         "latest_order_date": "",
         "revocation_signal": "",
         "certification_order_date": "",
+        "certification_order_date_source": "",
     }
     if not text or not text.strip():
         return blank
@@ -419,24 +444,66 @@ def classify_dossier_text(text: str) -> dict[str, str]:
         signal = _revocation_signal(text)
 
     cert_dates = [
-        s["date"]
+        _certification_date(str(s["body"]))
         for s in sections
-        if s["date"] is not None
-        and "CERTIFICATION" in str(s["title"]).upper()
+        if "CERTIFICATION" in str(s["title"]).upper()
         and not _CERTIFYING_TITLE_RE.search(str(s["title"]))
     ]
+    cert_dates = [(value, source) for value, source in cert_dates if value is not None]
+    first_cert = min(cert_dates, key=lambda pair: pair[0]) if cert_dates else (None, "")
 
     return {
         "certification_status": STATUS_REVOKED if signal else STATUS_IN_EFFECT,
         "latest_order_title": latest_title,
         "latest_order_date": latest_date.isoformat() if latest_date else "",
         "revocation_signal": signal,
-        "certification_order_date": min(cert_dates).isoformat() if cert_dates else "",
+        "certification_order_date": first_cert[0].isoformat() if first_cert[0] else "",
+        "certification_order_date_source": first_cert[1],
     }
 
 
-def dossier_columns(pdf_bytes: bytes, *, pdf_to_text: Any = None) -> dict[str, str]:
-    """Probe one dossier PDF and classify it into the landed columns."""
+# Why a row has no certification date, one value per row (dbt reads it):
+FETCH_OK = "ok"
+FETCH_NO_LINK = "no_link"
+FETCH_FAILED = "fetch_failed"
+FETCH_UNREADABLE_BYTES = "unreadable_bytes"
+FETCH_IMAGE_ONLY_OCR_UNAVAILABLE = "image_only_ocr_unavailable"
+FETCH_IMAGE_ONLY_UNREAD = "image_only_unread"
+FETCH_NO_CERT_SECTION = "no_certification_section"
+FETCH_DATE_NOT_MATCHED = "date_not_matched"
+
+OCR_HEAD_PAGES = 2
+OCR_TAIL_PAGES = 2
+
+
+def _ocr_dossier(pdf_bytes: bytes, page_count: int, ocr: Any) -> str | None:
+    """OCR the head (the certification) and the tail (the latest order)."""
+    head_last = max(1, min(OCR_HEAD_PAGES, page_count or OCR_HEAD_PAGES))
+    head = ocr(pdf_bytes, first_page=1, last_page=head_last)
+    if head is None:
+        return None
+    parts = [head]
+    if page_count and page_count > head_last:
+        tail_first = max(head_last + 1, page_count - OCR_TAIL_PAGES + 1)
+        tail = ocr(pdf_bytes, first_page=tail_first, last_page=page_count)
+        if tail:
+            parts.append(tail)
+    return "\f".join(p for p in parts if p)
+
+
+def dossier_columns(
+    pdf_bytes: bytes,
+    *,
+    pdf_to_text: Any = None,
+    ocr: Any = ocr_pdf,
+) -> dict[str, str]:
+    """Probe one dossier PDF and classify it into the landed columns.
+
+    ``pdf_fetch_status`` says why a row has no certification date, so a null
+    can be attributed: bytes that are not a PDF, a scan on a host without
+    OCR, a scan OCR could not read, a readable dossier with no certification
+    order, or one whose certification order carries no date the parser knows.
+    """
     extractor = pdf_to_text or extract_text
     probe: PdfProbe = probe_pdf_bytes(pdf_bytes)
 
@@ -448,6 +515,9 @@ def dossier_columns(pdf_bytes: bytes, *, pdf_to_text: Any = None) -> dict[str, s
         "latest_order_date": "",
         "revocation_signal": "",
         "certification_order_date": "",
+        "certification_order_date_source": "",
+        "dossier_text_method": "",
+        "pdf_fetch_status": FETCH_UNREADABLE_BYTES,
     }
 
     if probe.is_image_only is None:
@@ -457,12 +527,30 @@ def dossier_columns(pdf_bytes: bytes, *, pdf_to_text: Any = None) -> dict[str, s
     columns["is_image_only"] = "true" if probe.is_image_only else "false"
     columns["text_chars"] = str(probe.text_chars)
     if probe.is_image_only:
-        return columns
-
-    text = extractor(pdf_bytes) or ""
+        text = _ocr_dossier(pdf_bytes, probe.page_count_hint, ocr) if ocr else None
+        if text is None:
+            columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_OCR_UNAVAILABLE
+            return columns
+        if not text.strip():
+            columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_UNREAD
+            return columns
+        columns["dossier_text_method"] = "ocr"
+    else:
+        text = extractor(pdf_bytes) or ""
+        columns["dossier_text_method"] = "text_layer"
     if text.strip():
         columns["text_chars"] = str(len(text.strip()))
     columns.update(classify_dossier_text(text))
+    if columns["certification_order_date"]:
+        columns["pdf_fetch_status"] = FETCH_OK
+    elif any(
+        "CERTIFICATION" in str(section["title"]).upper()
+        and not _CERTIFYING_TITLE_RE.search(str(section["title"]))
+        for section in find_order_sections(text)
+    ):
+        columns["pdf_fetch_status"] = FETCH_DATE_NOT_MATCHED
+    else:
+        columns["pdf_fetch_status"] = FETCH_NO_CERT_SECTION
     return columns
 
 
@@ -482,7 +570,7 @@ def read_dossiers(
     keeps its empty columns, which reads as "not measured" rather than as a
     claim about the certification.
     """
-    fetcher = fetch_pdf or fetch_bytes
+    fetcher = fetch_pdf or fetch_document_bytes
     stats = {
         "rows": len(rows),
         "pdfs_fetched": 0,
@@ -505,6 +593,7 @@ def read_dossiers(
 
         url = row.get("certification_pdf_url") or ""
         if not url:
+            row["pdf_fetch_status"] = FETCH_NO_LINK
             stats["unknown"] += 1
             continue
 
@@ -530,6 +619,7 @@ def read_dossiers(
             data = None
 
         if data is None:
+            row["pdf_fetch_status"] = FETCH_FAILED
             stats["failures"] += 1
             stats["unknown"] += 1
             continue

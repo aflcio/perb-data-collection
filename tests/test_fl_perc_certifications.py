@@ -80,7 +80,7 @@ def test_parse_certification_table_minimal() -> None:
 
 def test_wide_fieldnames_carry_the_dossier_columns_in_order() -> None:
     start = WIDE_FIELDNAMES.index("pdf_file_name")
-    assert WIDE_FIELDNAMES[start : start + 8] == (
+    assert WIDE_FIELDNAMES[start : start + 11] == (
         "pdf_file_name",
         "is_image_only",
         "text_chars",
@@ -89,6 +89,9 @@ def test_wide_fieldnames_carry_the_dossier_columns_in_order() -> None:
         "latest_order_date",
         "revocation_signal",
         "certification_order_date",
+        "certification_order_date_source",
+        "dossier_text_method",
+        "pdf_fetch_status",
     )
 
 
@@ -155,11 +158,44 @@ def test_image_only_dossier_is_unknown_and_unclassified() -> None:
     def _never_called(_data: bytes, **_kwargs: object) -> str:
         raise AssertionError("must not extract text from an image-only PDF")
 
-    columns = dossier_columns(make_image_only_pdf(), pdf_to_text=_never_called)
+    # A host without OCR: the scan is reported as such, never as "no date".
+    columns = dossier_columns(make_image_only_pdf(), pdf_to_text=_never_called, ocr=None)
     assert columns["is_image_only"] == "true"
     assert columns["certification_status"] == "unknown"
     assert columns["latest_order_title"] == ""
     assert columns["certification_order_date"] == ""
+    assert columns["pdf_fetch_status"] == "image_only_ocr_unavailable"
+
+
+def test_image_only_dossier_that_ocr_cannot_read_says_so() -> None:
+    columns = dossier_columns(
+        make_image_only_pdf(), ocr=lambda _data, **_kw: ""
+    )
+    assert columns["pdf_fetch_status"] == "image_only_unread"
+    assert columns["certification_status"] == "unknown"
+
+
+def test_scanned_cert_999_is_ocrd_and_its_later_revocation_wins() -> None:
+    # FL_PERC:999 (West Melbourne / FOP): certified 1992 (RC-92-039), then a
+    # 1994 decertification election revoked it (RD-93-016). The dossier is a
+    # scan; this is its OCR text as the CLRR curation server read it.
+    text = _fixture_text("cert999_west_melbourne_ocr")
+    columns = dossier_columns(
+        make_image_only_pdf(), ocr=lambda _data, **_kw: text
+    )
+    assert columns["dossier_text_method"] == "ocr"
+    assert columns["certification_status"] == "revoked"
+    # The clerk's filing line is blank ("served on each party on , 1992"), so
+    # the date is the election's, and is labelled as that.
+    assert columns["certification_order_date"] == "1992-11-16"
+    assert columns["certification_order_date_source"] == "first_date_in_order"
+    assert columns["pdf_fetch_status"] == "ok"
+
+
+def test_ordinal_sealing_dates_parse() -> None:
+    from perb_data_collection.collectors.fl_perc_certifications import _parse_dates
+
+    assert [d.isoformat() for d in _parse_dates("ENTERED this 14th day of June, 2011.")] == ["2011-06-14"]
 
 
 def test_unreadable_bytes_leave_readability_empty() -> None:
@@ -167,6 +203,7 @@ def test_unreadable_bytes_leave_readability_empty() -> None:
     assert columns["is_image_only"] == ""
     assert columns["text_chars"] == ""
     assert columns["certification_status"] == "unknown"
+    assert columns["pdf_fetch_status"] == "unreadable_bytes"
 
 
 def test_dossier_columns_on_a_text_pdf() -> None:

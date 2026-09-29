@@ -6,18 +6,36 @@ Walk perb.delaware.gov year decision pages (1984–present), collect each
 decision PDF link + anchor title, map ULP/REP/clarification language into the
 shared canonical case-type enum, then write a wide CSV.
 
-Party / employer hints come from filename `-v-` splits and title text.
+Each decision PDF is then read for its caption and its date. The caption's
+own labels (Charging Party / Petitioner / Appellant, Respondent / Appellee)
+give each party's standing, and :mod:`perb_data_collection.party_roles` decides
+by content which is the employer and which the union. Position never decides:
+Delaware files ULP charges both ways, so "1546-...-DSCYF-v-LiUNA" has the
+employer on the left and "1427-...-LiUNA-1029-v-DSCYF" has it on the right.
+
+The order's own date ("DATE: June 29, 2026") is kept with ``day`` precision.
+The year page only says the year; when the document cannot be read the row
+keeps ``decision_year`` and no date, never a January 1.
+
+Filename splits remain only as the fallback for an unreadable document.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import unquote, urljoin
 
-from perb_data_collection.http import fetch_url, strip_html_text
+from perb_data_collection.captions import joined, parse_labelled_caption
 from perb_data_collection.csv_io import write_wide_csv
+from perb_data_collection.dates import date_after
+from perb_data_collection.http import fetch_document_bytes, fetch_url, strip_html_text
+from perb_data_collection.party_roles import assign_roles
+from perb_data_collection.pdf_probe import TEXT_METHOD_TEXT_LAYER, document_text
+
+logger = logging.getLogger(__name__)
 
 FLOW_NAME = "DE PERB Decisions Flow"
 REPORT_PREFIX = "de_perb_decisions"
@@ -34,6 +52,15 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "decision_year",
     "employer_name",
     "union_name",
+    "party_source",
+    "petitioner",
+    "respondent",
+    "intervenor",
+    "order_date",
+    "order_date_raw",
+    "order_date_source",
+    "order_date_precision",
+    "document_text_method",
     "document_title",
     "pdf_url",
     "jurisdiction_city",
@@ -111,8 +138,9 @@ def _canonical(native_kind: str, title: str) -> str:
 def _parties_from_filename(filename: str) -> tuple[str, str]:
     stem = re.sub(r"\.pdf$", "", filename, flags=re.I)
     stem = re.sub(r"-website$", "", stem, flags=re.I)
-    # Prefer last -v- / -v.- / -v.-style split before normalizing dots.
-    match = re.search(r"^(?P<left>.+?)-v[.\s-]*(?P<right>.+)$", stem, flags=re.I)
+    # A "-v-" / "-v.-" / "-vs-" token only. The old pattern needed nothing
+    # after the "v", so "Smyrna-Vo-Tech" or "Village-of-Arden" split mid-word.
+    match = re.search(r"^(?P<left>.+?)-vs?\.?-(?P<right>.+)$", stem, flags=re.I)
     if match:
         left = re.sub(r"[.\-_]+", " ", match.group("left")).strip()
         right = re.sub(r"[.\-_]+", " ", match.group("right")).strip()
@@ -143,7 +171,11 @@ def _parties_from_filename(filename: str) -> tuple[str, str]:
             left = ""
         if _is_decision_type_label(right):
             right = ""
-        return right, left  # employer, union
+        # Decided by content: Delaware ULP charges run both ways, so the
+        # employer is on the left of "DSCYF-v-LiUNA" and on the right of
+        # "LiUNA-1029-v-DSCYF". An abbreviation the tokens cannot place
+        # ("DSCYF") stays empty rather than inheriting a role from position.
+        return assign_roles(left, right)
 
     stem = stem.replace(".", " ")
     # Older year archives: 1984-1-11-84-3-DS-Capital-Educators-Assn.pdf
@@ -218,8 +250,10 @@ def parse_year_page(
             case_number = re.sub(r"[^A-Za-z0-9]+", "-", filename)[:40]
 
         employer, union = _parties_from_filename(filename)
+        party_source = "filename" if (employer or union) else ""
         if not employer and desc and not _is_decision_type_label(desc):
             employer = desc[:120]
+            party_source = party_source or "title"
         # Never keep a decision-type label as employer or city.
         if employer and _is_decision_type_label(employer):
             employer = ""
@@ -241,6 +275,15 @@ def parse_year_page(
                 "decision_year": year,
                 "employer_name": employer,
                 "union_name": union,
+                "party_source": party_source if (employer or union) else "",
+                "petitioner": "",
+                "respondent": "",
+                "intervenor": "",
+                "order_date": "",
+                "order_date_raw": "",
+                "order_date_source": "",
+                "order_date_precision": "",
+                "document_text_method": "",
                 "document_title": desc or title,
                 "pdf_url": pdf_url,
                 "jurisdiction_city": _jurisdiction_city(employer),
@@ -254,10 +297,114 @@ def parse_year_page(
         )
     return rows
 
+# --- the decision document: caption and date -------------------------------
+
+_CAPTION_START_RE = re.compile(r"PUBLIC\s+EMPLOYMENT\s+RELATIONS\s+BOARD", flags=re.I)
+_CAPTION_END_RE = re.compile(
+    r"^\s*:?\s*(?:unfair\s+labor\s+practice\s+charge|representation\s+petition|"
+    r"declaratory\s+statement|appearances\b|decision\s+and\s+order|order\s+of\s+dismissal|"
+    r"probable\s+cause|board\s+decision|(?:ulp\s+|case\s+)?no\.\s*\d)",
+    flags=re.I,
+)
+_DATE_ANCHORS: tuple[str, ...] = (r"\bDATE\s*:",)
+_SO_ORDERED_ANCHORS: tuple[str, ...] = (r"IT\s+IS\s+SO\s+ORDERED", r"WHEREFORE")
+
+
+def parse_decision_document(text: str) -> dict[str, str]:
+    """Caption roles, employer/union by content, and the order date."""
+    out = {
+        "petitioner": "",
+        "respondent": "",
+        "intervenor": "",
+        "employer_name": "",
+        "union_name": "",
+        "order_date": "",
+        "order_date_raw": "",
+        "order_date_source": "",
+        "order_date_precision": "",
+    }
+    caption = parse_labelled_caption(text, start_re=_CAPTION_START_RE, end_re=_CAPTION_END_RE)
+    out["petitioner"] = joined(caption["petitioner"])
+    out["respondent"] = joined(caption["respondent"] + caption["agency"])
+    out["intervenor"] = joined(caption["intervenor"])
+    if out["petitioner"] and out["respondent"]:
+        employer, union = assign_roles(out["petitioner"], out["respondent"])
+        out["employer_name"], out["union_name"] = employer[:240], union[:240]
+    hit = date_after(text, _DATE_ANCHORS, window=60)
+    source = "date_line"
+    if not hit:
+        hit = date_after(text, _SO_ORDERED_ANCHORS, window=300)
+        source = "so_ordered"
+    if hit:
+        out["order_date"] = hit.iso
+        out["order_date_raw"] = hit.raw
+        out["order_date_source"] = source
+        out["order_date_precision"] = hit.precision
+    return out
+
+
+def apply_document(row: dict[str, str], text: str, method: str) -> dict[str, str]:
+    """Fold a decision's caption and date into ``row``.
+
+    Caption parties replace filename guesses only when the caption was read:
+    an unreadable PDF keeps the filename fallback and says so.
+    """
+    out = dict(row)
+    out["document_text_method"] = method
+    parsed = parse_decision_document(text)
+    for key in ("petitioner", "respondent", "intervenor", "order_date", "order_date_raw",
+                "order_date_source", "order_date_precision"):
+        out[key] = parsed[key]
+    if parsed["petitioner"] and parsed["respondent"]:
+        out["employer_name"] = parsed["employer_name"]
+        out["union_name"] = parsed["union_name"]
+        out["party_source"] = "caption"
+        out["jurisdiction_city"] = _jurisdiction_city(parsed["employer_name"])
+    return out
+
+
+def read_decision_documents(
+    rows: list[dict[str, str]],
+    *,
+    delay_seconds: float,
+    fetch_pdf: Any = None,
+    pdf_to_text: Any = None,
+) -> dict[str, int]:
+    """Read every row's PDF in place; return outcome counts."""
+    fetcher = fetch_pdf or fetch_document_bytes
+    counts: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        url = row.get("pdf_url") or ""
+        method = "no_document"
+        text = ""
+        if url:
+            try:
+                data = fetcher(url, delay_seconds=delay_seconds)
+            except Exception as exc:  # noqa: BLE001 - one bad PDF must not end the run
+                logger.warning("DE PERB decision fetch failed: %s (%s)", url, exc)
+                method = "fetch_failed"
+            else:
+                if pdf_to_text is not None:
+                    text, method = pdf_to_text(data) or "", TEXT_METHOD_TEXT_LAYER
+                else:
+                    text, method = document_text(data)
+        if method in ("no_document", "fetch_failed"):
+            rows[index] = {**row, "document_text_method": method}
+        else:
+            rows[index] = apply_document(row, text, method)
+        outcome = f"{method}:{'dated' if rows[index].get('order_date') else 'undated'}"
+        counts[outcome] = counts.get(outcome, 0) + 1
+    logger.warning("DE PERB decisions: document outcomes %s", counts)
+    return counts
+
+
 def scrape_decisions(
     *,
     delay_seconds: float = 0.25,
     fetch_html: Any = None,
+    read_documents: bool = True,
+    fetch_pdf: Any = None,
+    pdf_to_text: Any = None,
 ) -> list[dict[str, str]]:
     fetcher = fetch_html or fetch_url
     scraped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -280,6 +427,10 @@ def scrape_decisions(
 
     if not rows:
         raise RuntimeError("DE PERB year pages parsed 0 decision PDFs")
+    if read_documents:
+        read_decision_documents(
+            rows, delay_seconds=delay_seconds, fetch_pdf=fetch_pdf, pdf_to_text=pdf_to_text
+        )
     rows.sort(key=lambda row: (row["decision_year"], row["case_number"], row["pdf_url"]))
     return rows
 

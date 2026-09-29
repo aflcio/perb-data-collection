@@ -5,10 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from perb_data_collection.collectors.dc_perb_certifications import (
+    CERTIFIED,
+    SECTION_NOT_FOUND,
     _parse_order_date,
+    apply_document,
+    parse_caption_roles,
     parse_certification_table,
+    parse_certified_representative,
     scrape_certifications,
 )
+from perb_data_collection.pdf_probe import document_text
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -81,7 +87,8 @@ def test_parse_order_date_prefers_body_date_over_stamp() -> None:
     order_date, order_date_raw, order_date_source = _parse_order_date(text)
     assert order_date == "2025-07-17"
     assert order_date_raw == "July 17, 2025"
-    assert order_date_source == "body"
+    # The date sits in the "BY ORDER OF THE ... BOARD" closing block.
+    assert order_date_source == "order_block"
 
 
 def test_parse_order_date_falls_back_to_stamp_when_no_body_date() -> None:
@@ -159,7 +166,9 @@ def test_scrape_certifications_reads_documents_with_fake_fetcher() -> None:
     assert body_rows
     for row in body_rows:
         assert row["order_date"] == "2025-08-03"
-        assert row["order_date_source"] == "body"
+        # The date follows the "BY ORDER OF THE ... BOARD" closing block.
+        assert row["order_date_source"] == "order_block"
+        assert row["order_date_precision"] == "day"
 
     # Every remaining row got a stamp-sourced date from the fake extractor.
     other_rows = [
@@ -174,3 +183,96 @@ def test_scrape_certifications_reads_documents_with_fake_fetcher() -> None:
 
     # The failing document was retried once (two attempts) per occurrence.
     assert call_count["n"] >= 2 * len(failing_rows)
+
+
+# --- the certification document decides the union (12-RC-02 and friends) ---
+#
+# Fixtures are the real documents: OCR text of the scanned certifications
+# (tesseract over pdftoppm at 200 dpi), the text layer of digital ones, and one
+# .docx as DC serves it.
+
+
+def _live_row(case_number: str, certification_number: str) -> dict[str, str]:
+    html = (FIXTURES / "dc_perb_certifications_live_2026-09-10.html").read_text()
+    rows = parse_certification_table(html, scraped_at="2026-09-29T00:00:00+00:00")
+    return next(
+        r for r in rows
+        if r["case_number"] == case_number and r["certification_number"] == certification_number
+    )
+
+
+def test_listing_strips_the_trailing_vs_and_keeps_the_raw_cells() -> None:
+    row = _live_row("12-RC-02", "165")
+    assert row["listing_complainant"] == "International Union of Public Employees"
+    assert row["listing_respondent"].endswith("National Association of Government Employees, Local R3-07")
+    # Two unions in the listing: which one represents the unit is the
+    # certification's outcome, so the listing alone names no union.
+    assert row["union_name"] == ""
+    assert row["employer_name"] == "District of Columbia Office of Unified Communications"
+
+
+def test_12_rc_02_certifies_nage_not_the_petitioner() -> None:
+    text = (FIXTURES / "dc_perb_12-rc-02_cert165_ocr.txt").read_text()
+    out = apply_document(_live_row("12-RC-02", "165"), text, "ocr")
+    assert out["petitioner"] == "International Union of Public Employees"
+    assert out["agency"] == "District of Columbia Office of Unified Communications"
+    assert out["intervenor"] == "National Association of Government Employees, Local R3-07"
+    assert out["certified_representative"] == (
+        "National Association of Government Employees, Local R3-07"
+    )
+    assert out["certification_result"] == CERTIFIED
+    assert out["union_name"] == out["certified_representative"]
+    assert out["union_name_source"] == "certification"
+    assert out["employer_name"] == "District of Columbia Office of Unified Communications"
+    assert out["order_date"] == "2018-12-05"
+    assert out["order_date_source"] == "order_block"
+
+
+def test_contested_certification_that_cannot_be_read_names_no_union() -> None:
+    # 81-RC-05: FOP petitioned, IBPO Local 442 intervened, FOP won. The scan's
+    # right edge is cropped, so OCR loses the winner's name. The listing's
+    # one-union guess used to pick the intervenor; now nothing is claimed.
+    text = (FIXTURES / "dc_perb_81-rc-05_cert10_ocr.txt").read_text()
+    out = apply_document(_live_row("81-RC-05", "10"), text, "ocr")
+    assert out["certified_representative"] == ""
+    assert out["certification_result"] == SECTION_NOT_FOUND
+    assert "Local 442" not in out["union_name"]
+
+
+def test_parenthetical_acronym_survives_caption_cleanup() -> None:
+    text = (FIXTURES / "dc_perb_96-rc-03_cert94.txt").read_text()
+    name, result = parse_certified_representative(text)
+    assert result == CERTIFIED
+    assert name.endswith("AFL-CIO (IBPO)")
+    roles = parse_caption_roles(text)
+    assert roles["petitioner"] == "District of Columbia Protective Services Association"
+    assert roles["agency"] == "District of Columbia Department of Administrative Services"
+
+
+def test_decertification_petition_by_individuals_keeps_the_incumbent() -> None:
+    text = (FIXTURES / "dc_perb_95-rd-01_cert92.txt").read_text()
+    out = apply_document(_live_row("95-RD-01", "92"), text, "text_layer")
+    assert out["certified_representative"] == "International Association of Firefighters, Local 36"
+    assert out["respondent"] == "International Association of Firefighters, Local 36"
+    assert out["employer_name"] == "D.C. Fire and Emergency Medical Services Department"
+    assert out["petitioner"].startswith("Vaughn L. Bennett")
+
+
+def test_docx_certification_is_read() -> None:
+    text, method = document_text((FIXTURES / "dc_perb_24-rc-01_cert174.docx").read_bytes())
+    assert method == "docx"
+    name, result = parse_certified_representative(text)
+    assert (name, result) == ("American Federation of Government Employees Local 631", CERTIFIED)
+    assert _parse_order_date(text)[0] == "2024-10-17"
+
+
+def test_no_representative_certification_names_no_union() -> None:
+    text = (
+        "In the Matter of:\nSome Union Local 1\nPetitioner\nand\nD.C. Department of Parks\nAgency\n"
+        "CERTIFICATION OF RESULTS\nIT IS HEREBY CERTIFIED THAT: no labor organization has "
+        "been selected by a majority of the valid ballots cast.\n"
+    )
+    out = apply_document(_live_row("12-RC-02", "165"), text, "text_layer")
+    assert out["certification_result"] == "no_representative"
+    assert out["union_name"] == ""
+    assert out["union_name_source"] == "no_representative"
