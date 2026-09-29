@@ -5,9 +5,11 @@ import pytest
 
 from perb_data_collection.collectors.nmb_weekly_activity_reports import (
     ARCHIVE_URL,
+    MAX_ROW_KEY_LENGTH,
     BASE_URL,
     CURRENT_URL,
     WIDE_FIELDNAMES,
+    _assign_row_keys,
     _split_cases,
     classify_section,
     discover_report_urls,
@@ -217,3 +219,26 @@ def test_scrape_assigns_unique_keys_and_drops_a_repeated_report() -> None:
 def test_scrape_refuses_an_empty_archive() -> None:
     with pytest.raises(RuntimeError):
         scrape_weekly_reports(delay_seconds=0, fetch_html=lambda url, delay_seconds=0: "<html></html>")
+
+
+def test_long_craft_lists_keep_row_keys_within_128_characters() -> None:
+    craft = "Apprentices, Car Inspectors, Car Repairmen, Electricians, Electronic Specialists, General Maintainers and Machinists"
+    row = {
+        "report_week_end": "2000-06-16", "section": "representation_application",
+        "case_number": "CR-6691", "union_name": "RITU-TCU", "craft_class": craft,
+    }
+    rows = [dict(row), dict(row), {**row, "craft_class": craft + " and Helpers"}]
+    _assign_row_keys(rows)
+    keys = [r["row_key"] for r in rows]
+    assert all(len(key) <= MAX_ROW_KEY_LENGTH for key in keys)
+    assert len(set(keys)) == 3
+    assert keys[0].startswith("NMB-WAR:2000-06-16:REPRESENTATION-APPLICATION:CR-6691:RITU-TCU:APPRENTICES")
+    assert keys[1] == keys[0] + ":2"
+    # Deterministic: the same printed row gets the same key on every run.
+    again = [dict(row)]
+    _assign_row_keys(again)
+    assert again[0]["row_key"] == keys[0]
+    # Short keys are untouched.
+    short = [{**row, "craft_class": "Pilots"}]
+    _assign_row_keys(short)
+    assert short[0]["row_key"] == "NMB-WAR:2000-06-16:REPRESENTATION-APPLICATION:CR-6691:RITU-TCU:PILOTS"
