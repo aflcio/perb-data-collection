@@ -34,7 +34,7 @@ from urllib.parse import urlencode, urljoin, unquote
 
 from perb_data_collection.csv_io import write_wide_csv
 from perb_data_collection.dates import find_dates
-from perb_data_collection.http import fetch_document_bytes, fetch_url, strip_html_text
+from perb_data_collection.http import BROWSER_HEADERS, fetch_bytes, fetch_document_bytes, strip_html_text
 from perb_data_collection.pdf_probe import PdfProbe, extract_text, ocr_pdf, probe_pdf_bytes
 
 logger = logging.getLogger(__name__)
@@ -652,6 +652,20 @@ def read_dossiers(
     return stats
 
 
+def fetch_grid_page(url: str, *, delay_seconds: float = 0.0, timeout: int = 120) -> str:
+    """Fetch a certResults grid page with the full browser header set.
+
+    perc.myflorida.com does not refuse the identifiable collector user agent,
+    it never answers it: `CertNo=1501` timed out at 25s with the plain agent
+    and returned in 0.7s with these headers (2026-09-29), and the bulk
+    `Union=a` query spent three ten-minute timeouts the same way. That hang is
+    what the flow's grid-step failures have been.
+    """
+    return fetch_bytes(
+        url, delay_seconds=delay_seconds, timeout=timeout, headers=BROWSER_HEADERS
+    ).decode("utf-8", errors="replace")
+
+
 def scrape_certifications(
     *,
     delay_seconds: float = 0.25,
@@ -676,7 +690,7 @@ def scrape_certifications(
     it is logged and the certification number is skipped so the run
     continues.
     """
-    fetcher = fetch_html or fetch_url
+    fetcher = fetch_html or fetch_grid_page
     scraped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     by_cert: dict[str, dict[str, str]] = {}
     skipped_cert_numbers: list[int] = []

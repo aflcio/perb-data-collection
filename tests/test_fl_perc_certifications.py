@@ -427,3 +427,20 @@ def test_read_dossiers_fetch_failing_twice_leaves_columns_empty() -> None:
     assert row.get("is_image_only", "") == ""
     assert row.get("text_chars", "") == ""
     assert row.get("certification_status", "") == ""
+
+
+def test_grid_pages_are_fetched_with_the_browser_header_set(monkeypatch) -> None:
+    # perc.myflorida.com never answers the plain collector user agent.
+    from perb_data_collection.collectors import fl_perc_certifications as fl
+    from perb_data_collection.http import BROWSER_HEADERS
+
+    seen: dict[str, object] = {}
+
+    def fake_fetch_bytes(url, **kwargs):
+        seen.update(kwargs)
+        return b"<html></html>"
+
+    monkeypatch.setattr(fl, "fetch_bytes", fake_fetch_bytes)
+    assert fl.fetch_grid_page("https://perc.myflorida.com/co/certResults.aspx?CertNo=1", timeout=5) == "<html></html>"
+    assert seen["headers"] == BROWSER_HEADERS
+    assert seen["timeout"] == 5
