@@ -20,6 +20,7 @@ from perb_data_collection.collectors import (
     me_mlrb_unit_rep_cases,
     mn_bms_certifications,
     nmb_representation_determinations,
+    nmb_weekly_activity_reports,
     ne_cir_reporter,
     nh_pelrb_certifications,
     nj_perc_issued_decisions,
@@ -115,6 +116,12 @@ COLLECTORS: dict[str, dict[str, Any]] = {
         "csv_name": "nmb_representation_determinations.csv",
         "collect": nmb_representation_determinations.scrape_to_wide_csv,
         "module": nmb_representation_determinations,
+    },
+    "nmb-weekly-activity-reports": {
+        "description": "National Mediation Board weekly activity reports (mediation and representation dockets)",
+        "csv_name": "nmb_weekly_activity_reports.csv",
+        "collect": nmb_weekly_activity_reports.scrape_to_wide_csv,
+        "module": nmb_weekly_activity_reports,
     },
     "ne-cir-reporter": {
         "description": "Nebraska CIR Reporter decisions",
