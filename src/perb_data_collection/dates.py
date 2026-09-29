@@ -73,10 +73,15 @@ class DateHit:
     start: int = 0
 
 
-def bounded(year: int, *, today: date | None = None) -> bool:
-    """True when ``year`` is inside the plausible window for a board record."""
+def bounded(year: int, *, today: date | None = None, horizon_years: int = 1) -> bool:
+    """True when ``year`` is inside the plausible window for a board record.
+
+    ``horizon_years`` is how far past today a date may fall: one year for an
+    order, a filing or a certification; longer for a contract's expiry, which
+    is normally in the future.
+    """
     today = today or date.today()
-    return EARLIEST_YEAR <= year <= today.year + 1
+    return EARLIEST_YEAR <= year <= today.year + horizon_years
 
 
 def _ordinal_day(token: str) -> int | None:
@@ -92,8 +97,10 @@ def _ordinal_day(token: str) -> int | None:
     return None
 
 
-def _make(year: int, month: int, day: int, raw: str, start: int, today: date | None) -> DateHit | None:
-    if not bounded(year, today=today):
+def _make(
+    year: int, month: int, day: int, raw: str, start: int, today: date | None, horizon_years: int = 1
+) -> DateHit | None:
+    if not bounded(year, today=today, horizon_years=horizon_years):
         return None
     try:
         value = date(year, month, day)
@@ -102,7 +109,7 @@ def _make(year: int, month: int, day: int, raw: str, start: int, today: date | N
     return DateHit(value.isoformat(), "day", re.sub(r"\s+", " ", raw).strip()[:80], start)
 
 
-def find_dates(text: str, *, today: date | None = None) -> list[DateHit]:
+def find_dates(text: str, *, today: date | None = None, horizon_years: int = 1) -> list[DateHit]:
     """Every day-precision date in ``text`` inside the plausible window, in order."""
     hits: list[DateHit] = []
     for match in _MONTH_DAY_YEAR_RE.finditer(text):
@@ -113,6 +120,7 @@ def find_dates(text: str, *, today: date | None = None) -> list[DateHit]:
             match.group(0),
             match.start(),
             today,
+            horizon_years,
         )
         if hit:
             hits.append(hit)
@@ -127,6 +135,7 @@ def find_dates(text: str, *, today: date | None = None) -> list[DateHit]:
             match.group(0),
             match.start(),
             today,
+            horizon_years,
         )
         if hit:
             hits.append(hit)
@@ -138,6 +147,7 @@ def find_dates(text: str, *, today: date | None = None) -> list[DateHit]:
             match.group(0),
             match.start(),
             today,
+            horizon_years,
         )
         if hit:
             hits.append(hit)

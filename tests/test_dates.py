@@ -38,3 +38,8 @@ def test_year_only_is_a_year_never_a_january_first() -> None:
 def test_date_after_uses_the_closing_block() -> None:
     text = "By email dated June 15, 2026, ... June 18, 2026 ...\nIT IS SO ORDERED.\nDATE: June 29, 2026\n"
     assert date_after(text, (r"DATE\s*:",), window=60, today=TODAY).iso == "2026-06-29"
+
+
+def test_a_contract_expiry_may_be_years_out_when_asked() -> None:
+    assert find_dates("June 30, 2028", today=TODAY) == []
+    assert [h.iso for h in find_dates("June 30, 2028", today=TODAY, horizon_years=25)] == ["2028-06-30"]
