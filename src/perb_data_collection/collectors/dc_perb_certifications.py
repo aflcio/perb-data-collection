@@ -4,23 +4,49 @@ WHAT THIS FILE IS FOR
 ---------------------
 Scrape the embedded DataTables certification listing at
 casesearch.perb.dc.gov/?docType=Certifications (one HTML page, no pagination),
-map PERB case-type codes into the shared canonical enum, then write a wide CSV.
+map PERB case-type codes into the shared canonical enum, then read each
+certification document for the parties' roles, the certified representative
+and the order date, and write a wide CSV.
 
-Employer is the Respondent (agency); Complainant is typically the union.
+The listing's Complainant / Respondent columns are procedural positions, not
+roles. On a unit-modification petition the agency is the complainant; on
+12-RC-02 the respondent cell is "Office of Unified Communications and National
+Association of Government Employees, Local R3-07", the agency and the
+intervening union in one string. And the petitioner is not the winner:
+12-RC-02 was petitioned by the International Union of Public Employees and
+certified NAGE Local R3-07. So:
+
+* ``petitioner`` / ``respondent`` / ``agency`` / ``intervenor`` come from the
+  document's own caption labels, each kept in its own column;
+* ``certified_representative`` comes only from the operative "IT IS HEREBY
+  CERTIFIED THAT" section, and is the union this row is evidence for;
+* ``employer_name`` / ``union_name`` are decided by content
+  (:mod:`perb_data_collection.party_roles`) when the document cannot be read,
+  and ``union_name_source`` says which rule produced the union.
+
+Scanned certifications have no text layer; they are OCR'd, and
+``document_text_method`` records how the text was obtained.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import subprocess
-import tempfile
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin
 
-from perb_data_collection.http import fetch_url, fetch_bytes, strip_html_text
+from perb_data_collection.captions import joined, parse_labelled_caption
 from perb_data_collection.csv_io import write_wide_csv
+from perb_data_collection.dates import date_after, parse_month_abbr_stamp
+from perb_data_collection.http import fetch_document_bytes, fetch_url, strip_html_text
+from perb_data_collection.party_roles import (
+    assign_roles,
+    clean_party_text,
+    is_union,
+    split_side,
+)
+from perb_data_collection.pdf_probe import TEXT_METHOD_TEXT_LAYER, document_text
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +65,21 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "native_case_type",
     "employer_name",
     "union_name",
+    "union_name_source",
+    "listing_complainant",
+    "listing_respondent",
+    "petitioner",
+    "respondent",
+    "agency",
+    "intervenor",
+    "certified_representative",
+    "certification_result",
+    "document_text_method",
     "date_opened",
     "order_date",
     "order_date_raw",
     "order_date_source",
+    "order_date_precision",
     "dc_register_cite",
     "document_name",
     "document_url",
@@ -83,19 +120,25 @@ _BODY_DATE_RE = re.compile(
 _STAMP_DATE_RE = re.compile(
     r"\b([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{4})\s+\d{1,2}:\d{2}[AP]M\s+\w+"
 )
-_MONTH_ABBR_TO_NUM = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-}
+# The certification's own closing block: "BY ORDER OF THE PUBLIC EMPLOYEE
+# RELATIONS BOARD / Washington, D.C. / December 5, 2018". A cover letter or a
+# recital can carry other dates, so this block is read first.
+_ORDER_BLOCK_ANCHORS: tuple[str, ...] = (
+    r"BY\s+ORDER\s+OF\s+THE\s+PUBLIC\s+EMPLOYEE\s+RELATIONS\s+BOARD",
+)
 
 
 def _parse_order_date(text: str) -> tuple[str, str, str]:
     """Return (order_date ISO, order_date_raw, order_date_source).
 
-    Prefers the date spelled out in the order body over the e-filing/
-    received stamp; falls back to the stamp only when no body date is
-    found. Returns empty strings when neither is present or unparseable.
+    Prefers the certification's "BY ORDER OF THE BOARD" block, then the last
+    date spelled out in the body, then the e-filing/received stamp. Returns
+    empty strings when none is present or parseable.
     """
+    block = date_after(text, _ORDER_BLOCK_ANCHORS, window=250)
+    if block:
+        return block.iso, block.raw, "order_block"
+
     body_matches = _BODY_DATE_RE.findall(text)
     if body_matches:
         raw = body_matches[-1]
@@ -109,43 +152,107 @@ def _parse_order_date(text: str) -> tuple[str, str, str]:
     stamp_match = _STAMP_DATE_RE.search(text)
     if stamp_match:
         month_abbr, day, year = stamp_match.groups()
-        month = _MONTH_ABBR_TO_NUM.get(month_abbr[:3].title())
-        if month:
-            try:
-                parsed = datetime(int(year), month, int(day))
-            except ValueError:
-                pass
-            else:
-                raw = stamp_match.group(0)[:80]
-                return parsed.date().isoformat(), raw, "stamp"
+        parsed_stamp = parse_month_abbr_stamp(month_abbr, day, year)
+        if parsed_stamp:
+            return parsed_stamp.isoformat(), stamp_match.group(0)[:80], "stamp"
 
     return "", "", ""
 
 
-def _pdf_to_text(pdf_bytes: bytes) -> str:
-    """Run pdftotext -l 2 -layout over PDF bytes; "" if no readable text."""
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
-        handle.write(pdf_bytes)
-        handle.flush()
-        try:
-            completed = subprocess.run(
-                ["pdftotext", "-l", "2", "-layout", handle.name, "-"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "pdftotext is required to parse DC PERB certification PDFs"
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            logger.warning(
-                "pdftotext could not read document (no text layer or not a "
-                "PDF): %s",
-                exc.stderr or exc.stdout or exc,
-            )
-            return ""
-        return completed.stdout
+# --- the certification document: caption roles and the operative section ----
+
+# OCR reads the capital I of an old typescript as T ("Tn the Matter of").
+_CAPTION_START_RE = re.compile(r"\b[IT]n\s+the\s+matter\s+of\s*:?\)?", flags=re.I)
+_CAPTION_END_RE = re.compile(
+    r"^\s*(?:corrected\s+)?certificat(?:e|ion)\s+of\s+representati"
+    r"|^\s*decision\s+and\s+order\b"
+    r"|^\s*a\s+representation\s+proceeding\b"
+    r"|^\s*it\s+is\s+hereby\s+certified\b",
+    flags=re.I,
+)
+_CAPTION_NOISE_RES: tuple[re.Pattern[str], ...] = (
+    # OCR misreads: "7ERB Case No.", "Certification Ne. 10".
+    re.compile(r"[P7]ERB\s+Case\s+No[.:]?\s*[\w-]*", flags=re.I),
+    re.compile(r"Certification\s+N[oe][.:]?\s*\d*", flags=re.I),
+    re.compile(r"CORRECTED\s+COPY", flags=re.I),
+)
+
+
+def parse_caption_roles(text: str) -> dict[str, str]:
+    """Read the caption's labelled parties into petitioner/respondent/agency/intervenor.
+
+    Returns empty strings for roles the caption does not label. Nothing is
+    assigned by position: a name only lands in a column when the caption's own
+    label follows it.
+    """
+    found = parse_labelled_caption(
+        text, start_re=_CAPTION_START_RE, end_re=_CAPTION_END_RE, noise=_CAPTION_NOISE_RES
+    )
+    return {role: joined(found[role]) for role in ("petitioner", "respondent", "agency", "intervenor")}
+
+
+_CERT_SECTION_RE = re.compile(
+    r"IT\s+IS\s+HEREBY\s+CERTIFIED\s*(?:THAT)?\s*:?\s*(?P<body>.{0,700})",
+    flags=re.I | re.S,
+)
+# Tolerates a text layer that lost its word spaces ("hasbeendesignated").
+_DESIGNATED_RE = re.compile(
+    r"^(?P<name>.+?)\s*,?\s*(?:has|have)\s*been\s*(?:duly\s*)?(?:designated|selected|chosen)",
+    flags=re.I | re.S,
+)
+# Older certifications: "IT IS HEREBY CERTIFIED that a majority of the valid
+# ballots have been cast for the Fraternal Order of Police ... and that".
+_BALLOTS_CAST_FOR_RE = re.compile(
+    r"majority\s+of\s+the\s+valid\s+ballots\s+(?:has|have)\s+been\s+cast\s+for\s+"
+    r"(?P<name>.+?)(?:\s*,?\s+and\s+that\b|\s*,?\s+(?:and\s+)?(?:said|which)\s+labor\b|\.\s)",
+    flags=re.I | re.S,
+)
+_NO_REPRESENTATIVE_RE = re.compile(
+    r"\b(?:no\s+(?:labor\s+organization|exclusive\s+representative|representative)"
+    r"|(?:has|have)\s+not\s+been\s+cast\s+for\s+any"
+    r"|not\s+(?:selected|designated)\s+(?:any|a)\s+(?:labor\s+organization|representative))",
+    flags=re.I,
+)
+# Running page headers a multi-page certification repeats mid-sentence.
+_PAGE_HEADER_RE = re.compile(
+    r"^\s*(?:certificat(?:e|ion)\s+of\s+representati\w*|PERB\s+Case\s+No\.?.*|"
+    r"page\s+\d+(?:\s+of\s+\d+)?|certification\s+no\.?.*)\s*$",
+    flags=re.I | re.M,
+)
+
+CERTIFIED = "representative_certified"
+NO_REPRESENTATIVE = "no_representative"
+SECTION_NOT_FOUND = "section_not_found"
+DOCUMENT_UNREADABLE = "document_unreadable"
+
+
+def parse_certified_representative(text: str) -> tuple[str, str]:
+    """Return ``(certified_representative, certification_result)``.
+
+    Only the operative section counts. The caption and the recitals name the
+    petitioner and the intervenor too, and on a contested election the
+    petitioner is not the winner.
+    """
+    if not text or not text.strip():
+        return "", DOCUMENT_UNREADABLE
+    flat = _PAGE_HEADER_RE.sub(" ", text)
+    match = _CERT_SECTION_RE.search(flat)
+    if not match:
+        return "", SECTION_NOT_FOUND
+    body = re.sub(r"\s+", " ", match.group("body")).strip()
+    designated = _DESIGNATED_RE.match(body)
+    if designated and not _NO_REPRESENTATIVE_RE.search(designated.group("name")):
+        name = clean_party_text(designated.group("name"))
+        if name and not re.match(r"(?i)a\s+majority\b", name):
+            return name[:240], CERTIFIED
+    cast_for = _BALLOTS_CAST_FOR_RE.search(body)
+    if cast_for:
+        name = clean_party_text(cast_for.group("name"))
+        if name:
+            return name[:240], CERTIFIED
+    if _NO_REPRESENTATIVE_RE.search(body[:400]):
+        return "", NO_REPRESENTATIVE
+    return "", SECTION_NOT_FOUND
 
 
 def _absolute_url(href: str) -> str:
@@ -159,6 +266,65 @@ def _canonical(case_type: str) -> str:
     code = _native_code(case_type)
     return _CASE_TYPE_MAP.get(code, "CERTIFICATION")
 
+def _listing_roles(complainant: str, respondent: str) -> tuple[str, str]:
+    """Employer and union from the listing, decided by content.
+
+    The employer is every public body named on either side. The union is set
+    only when the listing names exactly one labour organisation; when it names
+    two (a petitioner and an incumbent) which one represents the unit is the
+    certification's outcome, and only the document says it.
+    """
+    employer, union = assign_roles(complainant, respondent)
+    if not employer:
+        publics = split_side(complainant)[0] + split_side(respondent)[0]
+        employer = "; ".join(publics)
+    return employer[:240], union[:240]
+
+
+def apply_document(row: dict[str, str], text: str, method: str) -> dict[str, str]:
+    """Fold one certification document's roles, outcome and date into ``row``."""
+    out = dict(row)
+    out["document_text_method"] = method
+    roles = parse_caption_roles(text)
+    out.update(roles)
+    representative, result = parse_certified_representative(text)
+    out["certified_representative"] = representative
+    out["certification_result"] = result
+    if representative:
+        out["union_name"] = representative
+        out["union_name_source"] = "certification"
+    elif result == NO_REPRESENTATIVE:
+        # The Board certified that no representative was chosen. Naming the
+        # petitioner as the union would file a loss as a win.
+        out["union_name"] = ""
+        out["union_name_source"] = "no_representative"
+    else:
+        # The operative section could not be read. When the caption names two
+        # labour organisations (a petitioner and an incumbent or intervenor),
+        # which one won is exactly what is unknown, and the listing's guess
+        # picked the loser on 81-RC-05. Leave the union empty.
+        caption_unions = [
+            name
+            for key in ("petitioner", "respondent", "intervenor")
+            for name in roles[key].split("; ")
+            if name and is_union(name)
+        ]
+        if len(caption_unions) >= 2:
+            out["union_name"] = ""
+            out["union_name_source"] = "contested_unresolved"
+    agency = roles["agency"] or (
+        roles["respondent"] if split_side(roles["respondent"])[0] and not split_side(roles["respondent"])[1] else ""
+    )
+    if agency:
+        out["employer_name"] = agency[:240]
+    order_date, order_date_raw, order_date_source = _parse_order_date(text)
+    out["order_date"] = order_date
+    out["order_date_raw"] = order_date_raw
+    out["order_date_source"] = order_date_source
+    out["order_date_precision"] = "day" if order_date else ""
+    return out
+
+
 def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.I | re.S):
@@ -171,11 +337,11 @@ def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, s
         date_opened = strip_html_text(cells[1])
         certification_number = strip_html_text(cells[2])
         native_case_type = strip_html_text(cells[3])
-        complainant = strip_html_text(cells[4]).rstrip(",")
-        # The index carries a stray terminal comma on a handful of agency
-        # names. It is list punctuation, not part of the employer name (the
-        # complainant column has the same artifact).
-        respondent = strip_html_text(cells[5]).rstrip(",")
+        # The index carries stray list punctuation: a terminal comma on a
+        # handful of agency names and a trailing ", vs." on complainants.
+        complainant = clean_party_text(strip_html_text(cells[4]).rstrip(","))
+        respondent = clean_party_text(strip_html_text(cells[5]).rstrip(","))
+        employer, union = _listing_roles(complainant, respondent)
         cite = strip_html_text(cells[6]) if len(cells) > 6 else ""
         document_name = strip_html_text(cells[7]) if len(cells) > 7 else ""
         href_match = re.search(r'href="([^"]+)"', row_html, flags=re.I)
@@ -197,12 +363,23 @@ def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, s
                 "certification_number": certification_number,
                 "canonical_case_type": _canonical(native_case_type),
                 "native_case_type": native_case_type or _native_code(native_case_type),
-                "employer_name": respondent,
-                "union_name": complainant,
+                "employer_name": employer,
+                "union_name": union,
+                "union_name_source": "listing_roles" if union else "",
+                "listing_complainant": complainant,
+                "listing_respondent": respondent,
+                "petitioner": "",
+                "respondent": "",
+                "agency": "",
+                "intervenor": "",
+                "certified_representative": "",
+                "certification_result": "",
+                "document_text_method": "",
                 "date_opened": date_opened,
                 "order_date": "",
                 "order_date_raw": "",
                 "order_date_source": "",
+                "order_date_precision": "",
                 "dc_register_cite": cite,
                 "document_name": document_name,
                 "document_url": document_url,
@@ -221,41 +398,37 @@ def parse_certification_table(html: str, *, scraped_at: str) -> list[dict[str, s
         )
     return rows
 
-def _read_order_date(
+def _read_document(
     document_url: str,
     *,
     delay_seconds: float,
     fetch_pdf: Any,
     pdf_to_text: Any,
-) -> tuple[str, str, str]:
-    """Fetch one certification PDF and parse its order date.
+) -> tuple[str, str]:
+    """Fetch one certification document; return ``(text, method)``.
 
-    Retries the fetch once on failure; on repeated failure returns empty
-    values so the caller leaves the row's date columns blank and moves on.
+    Retries the fetch once. After a second failure the method is
+    ``fetch_failed`` and the row keeps its listing values: a failed read is not
+    a document that says nothing.
     """
-    pdf_bytes: bytes | None = None
+    data: bytes | None = None
     last_exc: Exception | None = None
     for attempt in range(2):
         try:
-            pdf_bytes = fetch_pdf(document_url, delay_seconds=delay_seconds)
+            data = fetch_pdf(document_url, delay_seconds=delay_seconds)
             break
         except Exception as exc:  # noqa: BLE001 - deliberately broad, logged below
             last_exc = exc
-            if attempt == 0:
-                continue
-    if pdf_bytes is None:
+    if data is None:
         logger.warning(
-            "Could not fetch certification document after retry, leaving "
-            "order_date blank: %s (%s)",
+            "Could not fetch certification document after retry: %s (%s)",
             document_url,
             last_exc,
         )
-        return "", "", ""
-
-    text = pdf_to_text(pdf_bytes)
-    if not text:
-        return "", "", ""
-    return _parse_order_date(text)
+        return "", "fetch_failed"
+    if pdf_to_text is not None:
+        return pdf_to_text(data) or "", TEXT_METHOD_TEXT_LAYER
+    return document_text(data)
 
 
 def scrape_certifications(
@@ -274,35 +447,26 @@ def scrape_certifications(
         raise RuntimeError(f"DC PERB certifications page parsed 0 rows: {LISTING_URL}")
 
     if read_documents:
-        pdf_fetcher = fetch_pdf or fetch_bytes
-        text_extractor = pdf_to_text or _pdf_to_text
-        found = 0
-        missing = 0
-        for row in rows:
+        pdf_fetcher = fetch_pdf or fetch_document_bytes
+        counts: dict[str, int] = {}
+        for index, row in enumerate(rows):
             document_url = row.get("document_url", "")
             if not document_url:
-                missing += 1
+                counts["no_document"] = counts.get("no_document", 0) + 1
                 continue
-            order_date, order_date_raw, order_date_source = _read_order_date(
+            text, method = _read_document(
                 document_url,
                 delay_seconds=delay_seconds,
                 fetch_pdf=pdf_fetcher,
-                pdf_to_text=text_extractor,
+                pdf_to_text=pdf_to_text,
             )
-            row["order_date"] = order_date
-            row["order_date_raw"] = order_date_raw
-            row["order_date_source"] = order_date_source
-            if order_date:
-                found += 1
+            if method == "fetch_failed":
+                rows[index] = {**row, "document_text_method": method}
             else:
-                missing += 1
-        logger.warning(
-            "DC PERB certifications: order_date read for %d/%d rows (%d without a "
-            "usable document date)",
-            found,
-            len(rows),
-            missing,
-        )
+                rows[index] = apply_document(row, text, method)
+            result = rows[index].get("certification_result") or method
+            counts[result] = counts.get(result, 0) + 1
+        logger.warning("DC PERB certifications: document outcomes %s", counts)
 
     rows.sort(key=lambda row: row["case_number"])
     return rows

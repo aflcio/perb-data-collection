@@ -35,6 +35,7 @@ When the tokens do not settle a role, the column is left empty.
 from __future__ import annotations
 
 import re
+from html import unescape
 
 # --- token vocabularies -------------------------------------------------
 #
@@ -99,7 +100,9 @@ _STRONG_UNION_TOKENS: tuple[str, ...] = (
     r"ibt\b",
     r"unite here",
     r"steelworkers",
+    r"(?:fraternal\s+)?order\s+of\s+police",
     r"laborers",
+    r"liuna\b",
     r"carpenters",
     r"machinists",
     r"operating engineers",
@@ -203,7 +206,9 @@ _UNION_OF_RE = re.compile(
 
 # Numbered subordinate bodies: Local 88, Council 75, Lodge No. 12, Chapter 3.
 _NUMBERED_UNIT_RE = re.compile(
-    r"\b(?:local|council|lodge|chapter|district council|unit)\s+(?:no\.?\s*)?#?\d+",
+    # "Colonial Intermediate Unit 20" is a Pennsylvania school entity, not a
+    # bargaining unit.
+    r"\b(?:local|council|lodge|chapter|district council|(?<!intermediate )unit)\s+(?:no\.?\s*)?#?\d+",
     flags=re.I,
 )
 
@@ -387,7 +392,10 @@ def is_personal_name(text: str) -> bool:
 # Only " and " (with or without a serial comma) separates parties.  A bare
 # comma does not: it appears inside single names — "American Federation of
 # State, County and Municipal Employees", "Oregon AFSCME, Council 75".
-_ATOM_SPLIT_RE = re.compile(r"\s*,\s*and\s+|\s+and\s+", flags=re.I)
+# An ampersand joins parties the same way ("Colonial Intermediate Unit 20 &
+# Pennsylvania State Education Association"); a split still has to prove both
+# roles, and a side whose own head names one union is never split.
+_ATOM_SPLIT_RE = re.compile(r"\s*,\s*and\s+|\s+and\s+|\s+&\s+", flags=re.I)
 
 
 def _classify(fragment: str) -> str:
@@ -412,6 +420,7 @@ def _classify(fragment: str) -> str:
 # opening of a union's own name) must not qualify.
 _MUNICIPAL_LEAD_RE = re.compile(
     r"^(?:the\s+)?(?:city|town|county|state|port|village|borough|township)\s+of\b"
+    r"|^(?:the\s+)?(?:government\s+of\s+the\s+)?district\s+of\s+columbia\b"
     r"|\b(?:county|school\s+district|department|sheriff[’']?s?\s+office|"
     r"police\s+department|fire\s+district)\b",
     flags=re.I,
@@ -640,3 +649,62 @@ def assign_roles(left: str, right: str) -> tuple[str, str]:
     if employer and union and employer == union:
         return "", ""
     return employer, union
+
+
+# --- cleaning a party string lifted from a caption -------------------------
+
+def strip_unbalanced_parens(text: str) -> str:
+    """Drop the ``)`` a caption draws as its right-hand column.
+
+    Only a ``)`` with no open ``(`` before it goes: "AFL-CIO (IBPO)" keeps its
+    parenthetical, "Respondent. ) ) )" and "Petitioner)" lose the column.
+    """
+    out: list[str] = []
+    depth = 0
+    for char in text or "":
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                out.append(" ")
+                continue
+            depth -= 1
+        out.append(char)
+    return "".join(out)
+_TRAILING_VERSUS_RE = re.compile(r"[\s,]+(?:v|vs)\.?\s*$", flags=re.I)
+_TRAILING_ROLE_RE = re.compile(
+    r"[\s,;.]*\b(?:charging\s+part(?:y|ies)|petitioners?|respondents?|"
+    r"intervenors?|complainants?|appellants?|appellees?|plaintiffs?|defendants?|"
+    r"agency|employer|labor\s+organization|incumbent)\s*[,.;:]?\s*$",
+    flags=re.I,
+)
+_TRAILING_CASE_NO_RE = re.compile(r"\s*\bcase\s+no\.?\s*[:#]?\s*\S*\s*$", flags=re.I)
+
+
+def clean_party_text(text: str) -> str:
+    """Strip the typography a caption wraps around a party name.
+
+    HTML entities (a Word export writes ``&nbsp;``, sometimes double-escaped as
+    ``&amp;nbsp;``), the ``)`` column that separates a caption from its case
+    number, a trailing ``v.``/``vs.`` and a trailing procedural label
+    ("Petitioner", "Respondent.", "Charging Party,") all come off. The name's
+    own punctuation stays.
+    """
+    value = text or ""
+    for _ in range(2):
+        value = unescape(value)
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"&nbsp;?", " ", value, flags=re.I)
+    value = strip_unbalanced_parens(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    for _ in range(3):
+        before = value
+        value = _TRAILING_CASE_NO_RE.sub("", value)
+        value = _TRAILING_VERSUS_RE.sub("", value)
+        value = _TRAILING_ROLE_RE.sub("", value)
+        value = value.strip(" ,;:-–—")
+        if value == before:
+            break
+    # A leading article is caption style, not part of the name.
+    value = re.sub(r"^the\s+(?=[A-Z])", "", value, flags=re.I)
+    return value.strip()

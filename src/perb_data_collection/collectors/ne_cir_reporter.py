@@ -19,8 +19,12 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import unquote, urljoin
 
-from perb_data_collection.http import fetch_url
+from html import unescape
+
 from perb_data_collection.csv_io import write_wide_csv
+from perb_data_collection.dates import find_dates
+from perb_data_collection.http import fetch_url
+from perb_data_collection.party_roles import assign_roles, clean_party_text
 
 FLOW_NAME = "NE CIR Reporter Flow"
 REPORT_PREFIX = "ne_cir_reporter"
@@ -39,8 +43,15 @@ WIDE_FIELDNAMES: tuple[str, ...] = (
     "cir_volume",
     "cir_page",
     "decision_year",
+    "decision_date",
+    "decision_date_raw",
+    "decision_date_precision",
+    "cir_case_number",
     "employer_name",
     "union_name",
+    "petitioner",
+    "respondent",
+    "party_source",
     "document_title",
     "jurisdiction_city",
     "jurisdiction_state",
@@ -154,10 +165,30 @@ def _canonical_from_title(title: str) -> str:
     return "ARBITRATION"
 
 
+# Word's "Save as Web Page" wraps the document in metadata: an <o:DocumentProperties>
+# block (author, word counts, "15.00"), <w:WordDocument> settings ("false false
+# false EN-US X-NONE X-NONE") and latent styles, all inside conditional
+# comments. Stripped only of tags, that metadata ran into the first caption
+# line, and 19 CIR 191's union read "99 28 14032 15.00 false false false EN-US
+# ... IBEW LOCAL 1536".
+_WORD_METADATA_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?is)<head\b.*?</head>"),
+    re.compile(r"(?is)<!--\[if[^\]]*\]>.*?<!\[endif\]-->"),
+    re.compile(r"(?is)<xml\b.*?</xml>"),
+    re.compile(r"(?is)<(script|style)\b.*?</\1>"),
+    re.compile(r"(?is)<!--.*?-->"),
+)
+
+
 def _html_to_lines(html: str) -> list[str]:
-    html = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", html)
+    for pattern in _WORD_METADATA_RES:
+        html = pattern.sub(" ", html)
+    # Word wraps its source at ~80 columns mid-paragraph ("Case\n  No. 1427"),
+    # so source newlines are spaces; only block tags end a line.
+    html = re.sub(r"[\r\n]+", " ", html)
     html = re.sub(r"(?i)<(br|/p|/div|/tr|/li|/h[1-6]|/td)\b[^>]*>", "\n", html)
     text = _TAG.sub(" ", html)
+    text = unescape(text).replace("\xa0", " ")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = []
     for raw in text.split("\n"):
@@ -167,15 +198,40 @@ def _html_to_lines(html: str) -> list[str]:
     return lines
 
 
+_CASE_NO_RE = re.compile(r"\bcase\s+no\.?\s*(?P<num>\d+(?:\.\d+)?)", flags=re.I)
+
+
 def parse_decision_caption(html: str) -> tuple[str, str] | None:
     """Return (employer_name, union_name) from a CIR decision body caption.
 
     Word-exported decisions put Petitioner / v. / Respondent in the body. Prefer
-    that over filename abbreviations (infra-75).
+    that over filename abbreviations (infra-75). Roles are decided by content
+    (:func:`perb_data_collection.party_roles.assign_roles`), not by which side
+    of the "v." a party sits on: employers petition the CIR too.
     """
+    parsed = parse_decision_document(html)
+    if not parsed["petitioner"] or not parsed["respondent"]:
+        return None
+    if not parsed["employer_name"] and not parsed["union_name"]:
+        return None
+    return parsed["employer_name"], parsed["union_name"]
+
+
+def parse_decision_document(html: str) -> dict[str, str]:
+    """Caption sides, roles by content, the CIR case number and the filed date."""
+    out = {
+        "petitioner": "",
+        "respondent": "",
+        "employer_name": "",
+        "union_name": "",
+        "cir_case_number": "",
+        "decision_date": "",
+        "decision_date_raw": "",
+        "decision_date_precision": "",
+    }
     lines = _html_to_lines(html)
     if not lines:
-        return None
+        return out
 
     start = 0
     for i, line in enumerate(lines):
@@ -192,30 +248,40 @@ def parse_decision_caption(html: str) -> tuple[str, str] | None:
             end = i
             break
 
+    case_no = _CASE_NO_RE.search("\n".join(lines[start:]))
+    if case_no:
+        out["cir_case_number"] = case_no.group("num")
+    # The decision's own "Filed March 6, 2017" line under the caption; later
+    # "filed" verbs in the body ("the Petitioner filed ...") carry other dates.
+    filed = None
+    for line in lines[end : end + 12]:
+        if re.match(r"(?i)^filed\b", line):
+            hits = find_dates(line)
+            filed = hits[0] if hits else None
+            break
+    if filed:
+        out["decision_date"] = filed.iso
+        out["decision_date_raw"] = filed.raw
+        out["decision_date_precision"] = filed.precision
+
     caption = " ".join(lines[start:end])
     caption = _WS.sub(" ", caption).strip()
     if not caption:
-        return None
+        return out
 
     # Split on a standalone v. / vs. between parties.
-    split = re.split(r"\bvs?\.?\b", caption, maxsplit=1, flags=re.I)
+    split = re.split(r"(?<![A-Za-z])vs?\.?(?![A-Za-z])", caption, maxsplit=1, flags=re.I)
     if len(split) != 2:
-        return None
+        return out
 
-    left = re.sub(r",?\s*petitioner\.?\s*$", "", split[0], flags=re.I).strip(" ,")
-    right = re.sub(r",?\s*respondent\.?\s*$", "", split[1], flags=re.I).strip(" ,.")
+    left = clean_party_text(split[0])
+    right = clean_party_text(split[1])
     if not left or not right:
-        return None
-
-    # Default CIR shape: petitioner = union, respondent = employer.
-    union, employer = left, right
-    # If cues strongly reverse that, swap.
-    if _EMPLOYER_CUES.search(left) and _UNION_CUES.search(right):
-        employer, union = left, right
-    elif _UNION_CUES.search(left) and _EMPLOYER_CUES.search(right):
-        union, employer = left, right
-
-    return employer[:240], union[:240]
+        return out
+    out["petitioner"], out["respondent"] = left[:240], right[:240]
+    employer, union = assign_roles(left, right)
+    out["employer_name"], out["union_name"] = employer[:240], union[:240]
+    return out
 
 
 def _scrub_employer_as_union(employer: str, union: str) -> tuple[str, str]:
@@ -250,8 +316,15 @@ def parse_decision_filename(
             "cir_volume": volume_dir.split("_", 1)[0],
             "cir_page": "",
             "decision_year": "",
+            "decision_date": "",
+            "decision_date_raw": "",
+            "decision_date_precision": "",
+            "cir_case_number": "",
             "employer_name": employer,
             "union_name": union,
+            "petitioner": "",
+            "respondent": "",
+            "party_source": "filename" if (employer or union) else "",
             "document_title": stem,
             "jurisdiction_city": "",
             "jurisdiction_state": "NE",
@@ -281,8 +354,15 @@ def parse_decision_filename(
         "cir_volume": vol,
         "cir_page": page,
         "decision_year": year,
+        "decision_date": "",
+        "decision_date_raw": "",
+        "decision_date_precision": "",
+        "cir_case_number": "",
         "employer_name": employer,
         "union_name": union,
+        "petitioner": "",
+        "respondent": "",
+        "party_source": "filename" if (employer or union) else "",
         "document_title": title,
         "jurisdiction_city": "",
         "jurisdiction_state": "NE",
@@ -295,18 +375,20 @@ def parse_decision_filename(
 
 
 def enrich_row_from_decision_html(row: dict[str, str], html: str) -> dict[str, str]:
-    """Prefer caption parties when the decision HTML parses cleanly."""
-    parsed = parse_decision_caption(html)
-    if not parsed:
-        return row
-    employer, union = _scrub_employer_as_union(*parsed)
+    """Prefer caption parties, the CIR case number and the filed date."""
+    parsed = parse_decision_document(html)
     out = dict(row)
-    if employer:
-        out["employer_name"] = employer
-    if union:
-        out["union_name"] = union
-    elif employer and _EMPLOYER_ONLY_UNION.match(row.get("union_name") or ""):
-        out["union_name"] = ""
+    for key in ("petitioner", "respondent", "cir_case_number", "decision_date",
+                "decision_date_raw", "decision_date_precision"):
+        if parsed[key]:
+            out[key] = parsed[key]
+    if not (parsed["employer_name"] or parsed["union_name"]):
+        return out
+    employer, union = _scrub_employer_as_union(parsed["employer_name"], parsed["union_name"])
+    out["party_source"] = "caption"
+    # The caption decides both columns; a filename guess never survives beside it.
+    out["employer_name"] = employer
+    out["union_name"] = union
     return out
 
 

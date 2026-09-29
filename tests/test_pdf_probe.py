@@ -149,3 +149,30 @@ def test_extract_text_reads_the_text_layer_or_returns_empty() -> None:
         assert "CERTIFICATION OF REPRESENTATIVE" in text
     assert extract_text(b"not a pdf") == ""
     assert extract_text(b"") == ""
+
+
+def test_space_starved_text_layer_is_detected() -> None:
+    from perb_data_collection.pdf_probe import looks_space_starved
+
+    starved = (
+        "TheAmericanFederationof State,countyandMunicipalEmployees, D.c. council20,Local "
+        "2743hasbeendesignated by the employeesin theunit describedbelowto continueastheir exclusive "
+        "representativefor the purposeof collectivebargainingover termsand conditionsof employment, "
+        "including compansation,with the District of Colum;ia Departmentof Insurancg Securitiesand"
+    )
+    clean = (
+        "The American Federation of State, County and Municipal Employees, D.C. Council 20, Local "
+        "2743 has been designated by the employees in the unit described below to continue as their "
+        "exclusive representative for the purpose of collective bargaining over terms and conditions "
+        "of employment, including compensation, with the District of Columbia Department of Insurance"
+    )
+    assert looks_space_starved(starved)
+    assert not looks_space_starved(clean)
+
+
+def test_document_text_reports_how_it_read_a_docx() -> None:
+    from perb_data_collection.pdf_probe import document_text
+
+    text, method = document_text((FIXTURES / "dc_perb_24-rc-01_cert174.docx").read_bytes())
+    assert method == "docx"
+    assert "IT IS HEREBY CERTIFIED THAT" in text

@@ -20,11 +20,15 @@ Nothing here needs a PDF library, and nothing here touches the network.
 
 from __future__ import annotations
 
+import io
 import re
+import shutil
 import subprocess
 import tempfile
+import zipfile
 import zlib
 from dataclasses import dataclass
+from html import unescape as html_unescape
 from pathlib import Path
 
 # A file with a font and a couple of stray operators but almost no glyphs is a
@@ -136,11 +140,15 @@ def probe_pdf_bytes(data: bytes) -> PdfProbe:
         return PdfProbe(error=f"{type(exc).__name__}: {exc}", is_image_only=None)
 
 
-def extract_text(data: bytes, *, first_pages: int | None = None) -> str:
-    """Extract the text layer with poppler ``pdftotext -layout``.
+def extract_text(data: bytes, *, first_pages: int | None = None, layout: bool = True) -> str:
+    """Extract the text layer with poppler ``pdftotext`` (``-layout`` by default).
 
     Returns '' on any failure, including poppler not being installed, so a
     caller can treat "no text" and "could not read" the same way.
+
+    ``layout=False`` keeps reading order, which is what a caption parser wants:
+    ``-layout`` interleaves a caption's ``)`` column and the case-number column
+    into the party names.
     """
     if not data:
         return ""
@@ -149,7 +157,7 @@ def extract_text(data: bytes, *, first_pages: int | None = None) -> str:
             pdf_path = Path(tmp) / "doc.pdf"
             txt_path = Path(tmp) / "doc.txt"
             pdf_path.write_bytes(data)
-            cmd = ["pdftotext", "-layout"]
+            cmd = ["pdftotext"] + (["-layout"] if layout else [])
             if first_pages is not None and first_pages > 0:
                 cmd.extend(["-f", "1", "-l", str(first_pages)])
             cmd.extend([str(pdf_path), str(txt_path)])
@@ -157,3 +165,111 @@ def extract_text(data: bytes, *, first_pages: int | None = None) -> str:
             return txt_path.read_text(encoding="utf-8", errors="replace")
     except Exception:  # noqa: BLE001 - extraction is best effort
         return ""
+
+
+# --- whole-document text, with OCR for scans --------------------------------
+#
+# A scanned order downloads perfectly and has no text layer, so "no text" from
+# pdftotext is not "no order". DC PERB's 12-RC-02 certification (No. 165) is a
+# three-page scan whose text layer holds only the e-filing stamp; the operative
+# "IT IS HEREBY CERTIFIED" section, which names a different union from the
+# petitioner, is on page 2 and is only readable by OCR.
+
+TEXT_METHOD_TEXT_LAYER = "text_layer"
+TEXT_METHOD_DOCX = "docx"
+TEXT_METHOD_OCR = "ocr"
+TEXT_METHOD_OCR_UNAVAILABLE = "ocr_unavailable"
+TEXT_METHOD_UNREADABLE = "unreadable"
+
+
+def ocr_pdf(data: bytes, *, first_page: int = 1, last_page: int | None = None, dpi: int = 200) -> str | None:
+    """OCR PDF pages with poppler ``pdftoppm`` + ``tesseract``.
+
+    Returns ``None`` (not '') when either tool is missing, so a caller can tell
+    "OCR found nothing" from "OCR was not possible here".
+    """
+    if not data:
+        return ""
+    if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "doc.pdf"
+            pdf_path.write_bytes(data)
+            cmd = ["pdftoppm", "-r", str(dpi), "-png", "-f", str(first_page)]
+            if last_page is not None:
+                cmd.extend(["-l", str(last_page)])
+            cmd.extend([str(pdf_path), str(Path(tmp) / "page")])
+            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+            pages: list[str] = []
+            for image in sorted(Path(tmp).glob("page-*.png")):
+                done = subprocess.run(
+                    ["tesseract", str(image), "stdout"],
+                    check=True,
+                    capture_output=True,
+                    timeout=180,
+                )
+                pages.append(done.stdout.decode("utf-8", errors="replace"))
+            return "\f".join(pages)
+    except Exception:  # noqa: BLE001 - OCR is best effort
+        return ""
+
+
+def docx_text(data: bytes) -> str:
+    """Paragraph text of a .docx (DC PERB serves some certifications as Word)."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            xml = archive.read("word/document.xml").decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    xml = re.sub(r"</w:p>", "\n", xml)
+    xml = re.sub(r"<w:tab/>", "\t", xml)
+    xml = re.sub(r"<w:br/>", "\n", xml)
+    return html_unescape(re.sub(r"<[^>]+>", "", xml))
+
+
+def looks_space_starved(text: str) -> bool:
+    """True when a text layer has lost its word spaces.
+
+    Old scanner software wrote text layers like "TheAmericanFederationof
+    State,countyandMunicipalEmployees". A name read from that matches nothing,
+    so such a layer is re-read by OCR.
+    """
+    words = re.findall(r"[A-Za-z]{2,}", text or "")
+    if len(words) < 30:
+        return False
+    long_words = sum(1 for word in words if len(word) >= 18)
+    return long_words / len(words) > 0.03
+
+
+def document_text(
+    data: bytes,
+    *,
+    layout: bool = False,
+    ocr_last_page: int | None = 8,
+) -> tuple[str, str]:
+    """Return ``(text, method)`` for a PDF or .docx, OCR'ing a scan.
+
+    ``method`` is one of ``text_layer``, ``docx``, ``ocr``, ``ocr_unavailable``
+    or ``unreadable``, so a null downstream can be attributed: a scan on a host
+    without tesseract is not the same finding as a document that says nothing.
+    """
+    if not data:
+        return "", TEXT_METHOD_UNREADABLE
+    if data[:2] == b"PK":
+        text = docx_text(data)
+        return text, TEXT_METHOD_DOCX if text.strip() else TEXT_METHOD_UNREADABLE
+    if b"%PDF-" not in data[:1024]:
+        return "", TEXT_METHOD_UNREADABLE
+    text = extract_text(data, layout=layout)
+    if len(re.sub(r"\s+", "", text)) >= 200 and not looks_space_starved(text):
+        return text, TEXT_METHOD_TEXT_LAYER
+    ocr = ocr_pdf(data, last_page=ocr_last_page)
+    if text.strip() and (not ocr or looks_space_starved(ocr)):
+        # A starved text layer still beats no OCR, or OCR that is no better.
+        return text, TEXT_METHOD_TEXT_LAYER
+    if ocr is None:
+        return text, TEXT_METHOD_OCR_UNAVAILABLE
+    if ocr.strip():
+        return ocr, TEXT_METHOD_OCR
+    return text, TEXT_METHOD_UNREADABLE
