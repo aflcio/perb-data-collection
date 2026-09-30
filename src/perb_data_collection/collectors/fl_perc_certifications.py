@@ -34,7 +34,7 @@ from urllib.parse import urlencode, urljoin, unquote
 
 from perb_data_collection.csv_io import write_wide_csv
 from perb_data_collection.dates import find_dates
-from perb_data_collection.http import fetch_document_bytes, fetch_url, strip_html_text
+from perb_data_collection.http import BROWSER_HEADERS, fetch_bytes, fetch_document_bytes, strip_html_text
 from perb_data_collection.pdf_probe import PdfProbe, extract_text, ocr_pdf, probe_pdf_bytes
 
 logger = logging.getLogger(__name__)
@@ -472,23 +472,32 @@ FETCH_IMAGE_ONLY_UNREAD = "image_only_unread"
 FETCH_NO_CERT_SECTION = "no_certification_section"
 FETCH_DATE_NOT_MATCHED = "date_not_matched"
 
-OCR_HEAD_PAGES = 2
-OCR_TAIL_PAGES = 2
+# A dossier is a stack of orders, oldest first, and a revocation can sit
+# anywhere after the certification: cert 999 (6 pages) is certified on page 1
+# and revoked on page 3. A read that skips pages cannot say a certification is
+# still in effect, so a dossier up to OCR_FULL_PAGES long is OCR'd whole, and a
+# longer one is read at its head and tail and reported as partial.
+OCR_FULL_PAGES = 12
+OCR_HEAD_PAGES = 3
+OCR_TAIL_PAGES = 4
+
+
+def _ocr_dossier_read(pdf_bytes: bytes, page_count: int, ocr: Any) -> tuple[str | None, bool]:
+    """``(text, covers_whole_document)``; text is None when OCR is unavailable."""
+    if page_count and page_count <= OCR_FULL_PAGES:
+        return ocr(pdf_bytes, first_page=1, last_page=page_count), True
+    if not page_count:
+        text = ocr(pdf_bytes, first_page=1, last_page=OCR_FULL_PAGES)
+        return text, False
+    head = ocr(pdf_bytes, first_page=1, last_page=OCR_HEAD_PAGES)
+    if head is None:
+        return None, False
+    tail = ocr(pdf_bytes, first_page=page_count - OCR_TAIL_PAGES + 1, last_page=page_count) or ""
+    return "\f".join(p for p in (head, tail) if p), False
 
 
 def _ocr_dossier(pdf_bytes: bytes, page_count: int, ocr: Any) -> str | None:
-    """OCR the head (the certification) and the tail (the latest order)."""
-    head_last = max(1, min(OCR_HEAD_PAGES, page_count or OCR_HEAD_PAGES))
-    head = ocr(pdf_bytes, first_page=1, last_page=head_last)
-    if head is None:
-        return None
-    parts = [head]
-    if page_count and page_count > head_last:
-        tail_first = max(head_last + 1, page_count - OCR_TAIL_PAGES + 1)
-        tail = ocr(pdf_bytes, first_page=tail_first, last_page=page_count)
-        if tail:
-            parts.append(tail)
-    return "\f".join(p for p in parts if p)
+    return _ocr_dossier_read(pdf_bytes, page_count, ocr)[0]
 
 
 def dossier_columns(
@@ -504,7 +513,12 @@ def dossier_columns(
     OCR, a scan OCR could not read, a readable dossier with no certification
     order, or one whose certification order carries no date the parser knows.
     """
-    extractor = pdf_to_text or extract_text
+    # Reading order, not -layout: the caption's ":" column interleaves into
+    # the order heading under -layout, so "VERIFICATION OF ELECTION RESULTS AND
+    # CERTIFICATION" never reads as a heading. Measured 2026-09-29 on 12
+    # text-layer dossiers the classifier missed: -layout dated 0, reading
+    # order dated 5.
+    extractor = pdf_to_text or (lambda data: extract_text(data, layout=False))
     probe: PdfProbe = probe_pdf_bytes(pdf_bytes)
 
     columns = {
@@ -526,8 +540,11 @@ def dossier_columns(
 
     columns["is_image_only"] = "true" if probe.is_image_only else "false"
     columns["text_chars"] = str(probe.text_chars)
+    covers_whole = True
     if probe.is_image_only:
-        text = _ocr_dossier(pdf_bytes, probe.page_count_hint, ocr) if ocr else None
+        text, covers_whole = (
+            _ocr_dossier_read(pdf_bytes, probe.page_count_hint, ocr) if ocr else (None, False)
+        )
         if text is None:
             columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_OCR_UNAVAILABLE
             return columns
@@ -538,9 +555,28 @@ def dossier_columns(
     else:
         text = extractor(pdf_bytes) or ""
         columns["dossier_text_method"] = "text_layer"
+        # The legacy 2007 scanning batch (…-031707000000.pdf) carries no font
+        # but enough drawing operators that the byte probe does not call it
+        # image-only, and pdftotext returns nothing: cert 999 read as "no
+        # certification section" although its OCR holds the 1992 certification
+        # and the 1994 revocation. An empty text layer is a scan; OCR it.
+        # Measured 2026-09-29: 28 of 40 missed dossiers had an empty layer, and
+        # OCR gave all 28 a status and 20 a certification date.
+        if len(re.sub(r"\s+", "", text)) < 200 and ocr is not None:
+            scanned, covers_whole = _ocr_dossier_read(pdf_bytes, probe.page_count_hint, ocr)
+            if scanned is None:
+                columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_OCR_UNAVAILABLE
+                return columns
+            if scanned.strip():
+                text = scanned
+                columns["dossier_text_method"] = "ocr"
     if text.strip():
         columns["text_chars"] = str(len(text.strip()))
     columns.update(classify_dossier_text(text))
+    if not covers_whole and columns["certification_status"] == STATUS_IN_EFFECT:
+        # No revocation in the pages read proves nothing about the pages not
+        # read, so "in effect" would be a claim the read cannot support.
+        columns["certification_status"] = STATUS_UNKNOWN
     if columns["certification_order_date"]:
         columns["pdf_fetch_status"] = FETCH_OK
     elif any(
@@ -652,6 +688,20 @@ def read_dossiers(
     return stats
 
 
+def fetch_grid_page(url: str, *, delay_seconds: float = 0.0, timeout: int = 120) -> str:
+    """Fetch a certResults grid page with the full browser header set.
+
+    perc.myflorida.com does not refuse the identifiable collector user agent,
+    it never answers it: `CertNo=1501` timed out at 25s with the plain agent
+    and returned in 0.7s with these headers (2026-09-29), and the bulk
+    `Union=a` query spent three ten-minute timeouts the same way. That hang is
+    what the flow's grid-step failures have been.
+    """
+    return fetch_bytes(
+        url, delay_seconds=delay_seconds, timeout=timeout, headers=BROWSER_HEADERS
+    ).decode("utf-8", errors="replace")
+
+
 def scrape_certifications(
     *,
     delay_seconds: float = 0.25,
@@ -676,7 +726,7 @@ def scrape_certifications(
     it is logged and the certification number is skipped so the run
     continues.
     """
-    fetcher = fetch_html or fetch_url
+    fetcher = fetch_html or fetch_grid_page
     scraped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     by_cert: dict[str, dict[str, str]] = {}
     skipped_cert_numbers: list[int] = []
