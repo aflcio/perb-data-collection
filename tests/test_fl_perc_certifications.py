@@ -454,3 +454,34 @@ def test_empty_text_layer_on_a_non_image_probe_is_ocrd() -> None:
     assert columns["dossier_text_method"] == "ocr"
     assert columns["certification_status"] == "revoked"
     assert columns["certification_order_date"] == "1992-11-16"
+
+
+def test_partial_ocr_never_reports_in_effect() -> None:
+    from perb_data_collection.collectors import fl_perc_certifications as fl
+
+    cert_only = _fixture_text("cert999_west_melbourne_ocr").split("BILLY J. RHODES")[0]
+    long_scan = fl.PdfProbe(has_image_xobject=True, page_count_hint=40, is_image_only=True)
+    import perb_data_collection.collectors.fl_perc_certifications as mod
+
+    original = mod.probe_pdf_bytes
+    mod.probe_pdf_bytes = lambda _data: long_scan
+    try:
+        columns = dossier_columns(b"%PDF-1.4", ocr=lambda _data, **_kw: cert_only)
+    finally:
+        mod.probe_pdf_bytes = original
+    # Head and tail of a 40-page dossier were read, the middle was not.
+    assert columns["certification_status"] == "unknown"
+    assert columns["certification_order_date"] == "1992-11-16"
+
+
+def test_short_dossier_is_ocrd_whole() -> None:
+    from perb_data_collection.collectors import fl_perc_certifications as fl
+
+    calls: list[tuple[int, int]] = []
+
+    def ocr(_data, *, first_page, last_page):
+        calls.append((first_page, last_page))
+        return "x"
+
+    text, whole = fl._ocr_dossier_read(b"", 6, ocr)
+    assert whole is True and calls == [(1, 6)]

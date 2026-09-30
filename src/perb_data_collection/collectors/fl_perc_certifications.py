@@ -472,23 +472,32 @@ FETCH_IMAGE_ONLY_UNREAD = "image_only_unread"
 FETCH_NO_CERT_SECTION = "no_certification_section"
 FETCH_DATE_NOT_MATCHED = "date_not_matched"
 
-OCR_HEAD_PAGES = 2
-OCR_TAIL_PAGES = 2
+# A dossier is a stack of orders, oldest first, and a revocation can sit
+# anywhere after the certification: cert 999 (6 pages) is certified on page 1
+# and revoked on page 3. A read that skips pages cannot say a certification is
+# still in effect, so a dossier up to OCR_FULL_PAGES long is OCR'd whole, and a
+# longer one is read at its head and tail and reported as partial.
+OCR_FULL_PAGES = 12
+OCR_HEAD_PAGES = 3
+OCR_TAIL_PAGES = 4
+
+
+def _ocr_dossier_read(pdf_bytes: bytes, page_count: int, ocr: Any) -> tuple[str | None, bool]:
+    """``(text, covers_whole_document)``; text is None when OCR is unavailable."""
+    if page_count and page_count <= OCR_FULL_PAGES:
+        return ocr(pdf_bytes, first_page=1, last_page=page_count), True
+    if not page_count:
+        text = ocr(pdf_bytes, first_page=1, last_page=OCR_FULL_PAGES)
+        return text, False
+    head = ocr(pdf_bytes, first_page=1, last_page=OCR_HEAD_PAGES)
+    if head is None:
+        return None, False
+    tail = ocr(pdf_bytes, first_page=page_count - OCR_TAIL_PAGES + 1, last_page=page_count) or ""
+    return "\f".join(p for p in (head, tail) if p), False
 
 
 def _ocr_dossier(pdf_bytes: bytes, page_count: int, ocr: Any) -> str | None:
-    """OCR the head (the certification) and the tail (the latest order)."""
-    head_last = max(1, min(OCR_HEAD_PAGES, page_count or OCR_HEAD_PAGES))
-    head = ocr(pdf_bytes, first_page=1, last_page=head_last)
-    if head is None:
-        return None
-    parts = [head]
-    if page_count and page_count > head_last:
-        tail_first = max(head_last + 1, page_count - OCR_TAIL_PAGES + 1)
-        tail = ocr(pdf_bytes, first_page=tail_first, last_page=page_count)
-        if tail:
-            parts.append(tail)
-    return "\f".join(p for p in parts if p)
+    return _ocr_dossier_read(pdf_bytes, page_count, ocr)[0]
 
 
 def dossier_columns(
@@ -531,8 +540,11 @@ def dossier_columns(
 
     columns["is_image_only"] = "true" if probe.is_image_only else "false"
     columns["text_chars"] = str(probe.text_chars)
+    covers_whole = True
     if probe.is_image_only:
-        text = _ocr_dossier(pdf_bytes, probe.page_count_hint, ocr) if ocr else None
+        text, covers_whole = (
+            _ocr_dossier_read(pdf_bytes, probe.page_count_hint, ocr) if ocr else (None, False)
+        )
         if text is None:
             columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_OCR_UNAVAILABLE
             return columns
@@ -551,7 +563,7 @@ def dossier_columns(
         # Measured 2026-09-29: 28 of 40 missed dossiers had an empty layer, and
         # OCR gave all 28 a status and 20 a certification date.
         if len(re.sub(r"\s+", "", text)) < 200 and ocr is not None:
-            scanned = _ocr_dossier(pdf_bytes, probe.page_count_hint, ocr)
+            scanned, covers_whole = _ocr_dossier_read(pdf_bytes, probe.page_count_hint, ocr)
             if scanned is None:
                 columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_OCR_UNAVAILABLE
                 return columns
@@ -561,6 +573,10 @@ def dossier_columns(
     if text.strip():
         columns["text_chars"] = str(len(text.strip()))
     columns.update(classify_dossier_text(text))
+    if not covers_whole and columns["certification_status"] == STATUS_IN_EFFECT:
+        # No revocation in the pages read proves nothing about the pages not
+        # read, so "in effect" would be a claim the read cannot support.
+        columns["certification_status"] = STATUS_UNKNOWN
     if columns["certification_order_date"]:
         columns["pdf_fetch_status"] = FETCH_OK
     elif any(
