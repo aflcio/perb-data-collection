@@ -504,7 +504,12 @@ def dossier_columns(
     OCR, a scan OCR could not read, a readable dossier with no certification
     order, or one whose certification order carries no date the parser knows.
     """
-    extractor = pdf_to_text or extract_text
+    # Reading order, not -layout: the caption's ":" column interleaves into
+    # the order heading under -layout, so "VERIFICATION OF ELECTION RESULTS AND
+    # CERTIFICATION" never reads as a heading. Measured 2026-09-29 on 12
+    # text-layer dossiers the classifier missed: -layout dated 0, reading
+    # order dated 5.
+    extractor = pdf_to_text or (lambda data: extract_text(data, layout=False))
     probe: PdfProbe = probe_pdf_bytes(pdf_bytes)
 
     columns = {
@@ -538,6 +543,21 @@ def dossier_columns(
     else:
         text = extractor(pdf_bytes) or ""
         columns["dossier_text_method"] = "text_layer"
+        # The legacy 2007 scanning batch (…-031707000000.pdf) carries no font
+        # but enough drawing operators that the byte probe does not call it
+        # image-only, and pdftotext returns nothing: cert 999 read as "no
+        # certification section" although its OCR holds the 1992 certification
+        # and the 1994 revocation. An empty text layer is a scan; OCR it.
+        # Measured 2026-09-29: 28 of 40 missed dossiers had an empty layer, and
+        # OCR gave all 28 a status and 20 a certification date.
+        if len(re.sub(r"\s+", "", text)) < 200 and ocr is not None:
+            scanned = _ocr_dossier(pdf_bytes, probe.page_count_hint, ocr)
+            if scanned is None:
+                columns["pdf_fetch_status"] = FETCH_IMAGE_ONLY_OCR_UNAVAILABLE
+                return columns
+            if scanned.strip():
+                text = scanned
+                columns["dossier_text_method"] = "ocr"
     if text.strip():
         columns["text_chars"] = str(len(text.strip()))
     columns.update(classify_dossier_text(text))

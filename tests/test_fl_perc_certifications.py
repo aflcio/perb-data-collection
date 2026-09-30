@@ -444,3 +444,13 @@ def test_grid_pages_are_fetched_with_the_browser_header_set(monkeypatch) -> None
     assert fl.fetch_grid_page("https://perc.myflorida.com/co/certResults.aspx?CertNo=1", timeout=5) == "<html></html>"
     assert seen["headers"] == BROWSER_HEADERS
     assert seen["timeout"] == 5
+
+
+def test_empty_text_layer_on_a_non_image_probe_is_ocrd() -> None:
+    # The 2007 batch: no font, drawing operators, and pdftotext returns nothing.
+    text = _fixture_text("cert999_west_melbourne_ocr")
+    pdf = make_text_pdf(["x"])  # probes as text, not image-only
+    columns = dossier_columns(pdf, pdf_to_text=lambda _data: "", ocr=lambda _data, **_kw: text)
+    assert columns["dossier_text_method"] == "ocr"
+    assert columns["certification_status"] == "revoked"
+    assert columns["certification_order_date"] == "1992-11-16"
