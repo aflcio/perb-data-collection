@@ -30,6 +30,20 @@ def test_parse_listing_items_from_fixture() -> None:
     assert rows_by_key["MD_PERB:418"]["document_description"] == (
         "Certification Of Representative"
     )
+    assert rows_by_key["MD_PERB:500"]["employer_name"] == "State of Maryland"
+    assert rows_by_key["MD_PERB:500"]["union_name"] == (
+        "Maryland Professional Employees Council"
+    )
+
+
+def test_parse_listing_items_accepts_single_class_markup() -> None:
+    """The pre-2026-09-30 markup carried one class on each article."""
+    html = (Path(__file__).parent / "fixtures" / "md_perb_election_certs_page.html").read_text()
+    multi = 'class="maryland-listing-item__container maryland-listing-item__"'
+    assert html.count(multi) == 37
+    single = html.replace(multi, 'class="maryland-listing-item__container"')
+    assert len(_parse_listing_items(single, scraped_at="x")) == 37
+    assert len(_parse_listing_items(html, scraped_at="x")) == 37
 
 
 def test_scrape_election_certifications_uses_fixture() -> None:
@@ -39,7 +53,7 @@ def test_scrape_election_certifications_uses_fixture() -> None:
         return html
 
     rows = scrape_election_certifications(fetch_html=fake_fetch)
-    assert len(rows) == 34
+    assert len(rows) == 35
     row_keys = {row["row_key"] for row in rows}
     assert "MD_PERB:412" not in row_keys
     assert "MD_PERB:425" not in row_keys
@@ -49,7 +63,7 @@ def test_scrape_election_certifications_uses_fixture() -> None:
 
 def test_scrape_raises_when_displayed_total_mismatches() -> None:
     html = (Path(__file__).parent / "fixtures" / "md_perb_election_certs_page.html").read_text()
-    html = html.replace("Displaying 1 - 36 of 36 results.", "Displaying 1 - 36 of 99 results.")
+    html = html.replace("Displaying 1 - 37 of 37 results.", "Displaying 1 - 37 of 99 results.")
 
     def fake_fetch(url: str, **kwargs: object) -> str:
         return html

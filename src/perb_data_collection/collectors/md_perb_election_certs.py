@@ -142,6 +142,10 @@ _DOCUMENT_PARTIES: dict[str, tuple[str, str]] = {
         "Alcohol, Tobacco and Cannabis Commission",
         "State Law Enforcement Officers Labor Alliance",
     ),
+    # Title only: the board uploaded a saved Acrobat viewer page, not the PDF, as
+    # media 500 ("PERB EL 2026-01, MPEC & State of Maryland").  MPEC is expanded as
+    # the board's own media 274 certification names it.
+    "500": ("State of Maryland", "Maryland Professional Employees Council"),
 }
 
 # Maryland publishes these entries twice under different media IDs and titles,
@@ -172,7 +176,9 @@ def _parse_employer_union(title: str) -> tuple[str, str]:
 def _parse_listing_items(html: str, *, scraped_at: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for article in re.findall(
-        r'<article class="maryland-listing-item__container"[^>]*>(.*?)</article>',
+        # The class list is open-ended: by 2026-09-30 the board had appended a second,
+        # empty modifier class ("maryland-listing-item__container maryland-listing-item__").
+        r'<article class="maryland-listing-item__container(?:\s[^"]*)?"[^>]*>(.*?)</article>',
         html,
         flags=re.I | re.S,
     ):
